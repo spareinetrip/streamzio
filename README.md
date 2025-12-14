@@ -119,12 +119,19 @@ For network access (not just localhost), you need HTTPS. Options:
 
 For Raspberry Pi, install Chromium:
 
+**Debian Trixie (and newer):**
+```bash
+sudo apt-get update
+sudo apt-get install chromium
+```
+
+**Older Debian/Raspbian versions:**
 ```bash
 sudo apt-get update
 sudo apt-get install chromium-browser
 ```
 
-The addon will automatically detect Chromium at `/usr/bin/chromium-browser` or `/usr/bin/chromium`.
+The addon will automatically detect Chromium at `/usr/bin/chromium`, `/usr/bin/chromium-browser`, or other common paths.
 
 **Note**: On first run, you may need to manually complete the Cloudflare challenge once. After that, cookies are saved and the browser runs in headless mode automatically.
 
