@@ -3,4 +3,7 @@ config.json
 *.log
 .DS_Store
 .browser-data/
+__pycache__/
+*.pyc
+debug_multiup.html
 
