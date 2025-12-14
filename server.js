@@ -102,11 +102,20 @@ async function getBrowser() {
             const cookieDbPath = path.join(userDataDir, 'Default', 'Cookies');
             const hasCookies = fs.existsSync(cookieDbPath);
             
-            // Use headless mode if cookies exist AND no challenge was detected recently
-            // Otherwise use visible browser for Cloudflare challenge
-            const useHeadless = hasCookies && !cloudflareChallengeDetected;
+            // Check if DISPLAY is available (for headless systems like Raspberry Pi without X server)
+            const hasDisplay = process.env.DISPLAY && process.env.DISPLAY !== '';
             
-            console.log(`   Mode: ${useHeadless ? 'headless' : 'visible'} (cookies exist: ${hasCookies}, challenge detected: ${cloudflareChallengeDetected})`);
+            // Use headless mode if:
+            // 1. No display available (headless server), OR
+            // 2. Cookies exist AND no challenge was detected recently
+            // Otherwise use visible browser for Cloudflare challenge (only if display is available)
+            const useHeadless = !hasDisplay || (hasCookies && !cloudflareChallengeDetected);
+            
+            if (!hasDisplay) {
+                console.log(`   No DISPLAY detected - using headless mode (required for headless servers)`);
+            } else {
+                console.log(`   Mode: ${useHeadless ? 'headless' : 'visible'} (cookies exist: ${hasCookies}, challenge detected: ${cloudflareChallengeDetected})`);
+            }
             
             // Browser args optimized for speed and Raspberry Pi compatibility
             const browserArgs = [
@@ -126,18 +135,27 @@ async function getBrowser() {
                 '--max_old_space_size=4096'  // Limit memory usage
             ];
             
+            // Add headless-specific args if no display is available
+            if (!hasDisplay) {
+                browserArgs.push('--headless=new');  // New headless mode
+                browserArgs.push('--virtual-time-budget=5000');  // Helps with Cloudflare bypass
+            }
+            
             // Launch browser with persistent user data directory
+            // Force headless if no display is available
+            const finalHeadless = !hasDisplay ? true : useHeadless;
+            
             globalBrowser = await puppeteer.launch({
-                headless: useHeadless,
+                headless: finalHeadless,
                 executablePath: executablePath || undefined,
                 userDataDir: userDataDir,
                 args: browserArgs
             });
             
-            console.log(`✅ Browser initialized and ready (${useHeadless ? 'headless' : 'visible'} mode)`);
+            console.log(`✅ Browser initialized and ready (${finalHeadless ? 'headless' : 'visible'} mode)`);
             
             // Track headless state
-            isBrowserHeadless = useHeadless;
+            isBrowserHeadless = finalHeadless;
             
             // Handle browser disconnection
             globalBrowser.on('disconnected', () => {
@@ -205,8 +223,11 @@ async function fetchMultiUpPage(url) {
         if (pageTitle.includes('Just a moment') || pageContent.includes('challenges.cloudflare.com')) {
             console.log(`⚠️  Cloudflare challenge detected!`);
             
-            // If we're in headless mode and got a challenge, restart in visible mode
-            if (isBrowserHeadless) {
+            // Check if DISPLAY is available
+            const hasDisplay = process.env.DISPLAY && process.env.DISPLAY !== '';
+            
+            // If we're in headless mode and got a challenge, restart in visible mode (only if display is available)
+            if (isBrowserHeadless && hasDisplay) {
                 console.log(`🔄 Cookies niet meer geldig! Browser opent opnieuw in visible mode voor Cloudflare challenge...`);
                 cloudflareChallengeDetected = true;
                 needsVisibleBrowser = true;
@@ -245,6 +266,9 @@ async function fetchMultiUpPage(url) {
                 if (newPageTitle.includes('Just a moment') || newPageContent.includes('challenges.cloudflare.com')) {
                     console.log(`⚠️  Browser venster is nu zichtbaar - voltooi de Cloudflare challenge handmatig`);
                 }
+            } else if (isBrowserHeadless && !hasDisplay) {
+                console.log(`⚠️  Cloudflare challenge detected but no display available - waiting in headless mode...`);
+                console.log(`   💡 On headless servers, Cloudflare may need manual intervention or cookies from another machine`);
             } else {
                 console.log(`⚠️  Browser is al in visible mode - voltooi de Cloudflare challenge handmatig`);
             }
