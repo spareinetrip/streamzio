@@ -17,9 +17,18 @@ function getDeviceId() {
     
     // Generate unique device ID based on hostname and random hash
     const os = require('os');
-    const hostname = os.hostname();
+    let hostname = os.hostname().toLowerCase();
+    
+    // Normalize hostname: if it contains "raspberry" or "pi", use "pi"
+    if (hostname.includes('raspberry') || hostname.includes('pi')) {
+        hostname = 'pi';
+    } else {
+        // Clean hostname: remove special chars, keep only alphanumeric and hyphens
+        hostname = hostname.replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+    }
+    
     const randomHash = crypto.randomBytes(4).toString('hex');
-    const deviceId = `${hostname}-${randomHash}`.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    const deviceId = `${hostname}-${randomHash}`;
     
     // Create full device ID with streamzio prefix
     // Remove any existing streamzio prefix to avoid duplication

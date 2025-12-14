@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=julien
+User=YOUR_USERNAME
 WorkingDirectory=/opt/streamzio
 ExecStart=/usr/bin/npm start
 Restart=on-failure

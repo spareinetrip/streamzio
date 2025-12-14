@@ -139,7 +139,7 @@ sudo nano /etc/systemd/system/streamzio.service
 sudo nano /etc/systemd/system/streamzio-tunnel.service
 ```
 
-Change `User=julien` to your actual username if different.
+Change `User=YOUR_USERNAME` to your actual username (e.g., `User=pi` or `User=julien`).
 
 ### Step 3: Enable and Start Services
 
@@ -187,9 +187,12 @@ Or check your `config.json`:
 cat /opt/streamzio/config.json | grep publicBaseUrl
 ```
 
-The tunnel URL will be automatically saved to `config.json`. Your unique subdomain will be something like `streamzio-raspberry-pi-abc123.loca.lt`.
+The tunnel URL will be automatically saved to `config.json`. Your unique subdomain will be something like `streamzio-pi-abc123.loca.lt`.
 
-**Note:** The tunnel service automatically generates a fixed subdomain based on your device hostname and a unique hash, so the URL stays the same across restarts.
+**Note:** 
+- The tunnel service automatically generates a fixed subdomain based on your device hostname and a unique hash, so the URL stays the same across restarts.
+- The tunnel URL is automatically updated in `config.json` when the tunnel starts. You can find it there or in the tunnel service logs.
+- For Raspberry Pi devices, the subdomain will use `pi` instead of the full hostname (e.g., `streamzio-pi-abc123` instead of `streamzio-raspberry-pi-abc123`).
 
 ## Raspberry Pi Setup
 
