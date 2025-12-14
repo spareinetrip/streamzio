@@ -1,0 +1,18 @@
+[Unit]
+Description=Streamzio Localtunnel
+After=network-online.target streamzio.service
+Wants=network-online.target streamzio.service
+Requires=streamzio.service
+
+[Service]
+Type=simple
+User=julien
+WorkingDirectory=/opt/streamzio
+ExecStart=/usr/bin/node start-tunnel.js
+Restart=on-failure
+RestartSec=10
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+

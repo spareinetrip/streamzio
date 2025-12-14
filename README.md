@@ -115,6 +115,82 @@ For network access (not just localhost), you need HTTPS. Options:
 
 2. **Deploy to a hosting service** (Heroku, Railway, etc.)
 
+## Systemd Service Setup (Raspberry Pi / Linux)
+
+For automatic startup and tunnel management, you can set up systemd services:
+
+### Step 1: Install Localtunnel
+
+```bash
+sudo npm install -g localtunnel
+```
+
+### Step 2: Copy Service Files
+
+```bash
+cd /opt/streamzio
+sudo cp streamzio.service /etc/systemd/system/
+sudo cp streamzio-tunnel.service /etc/systemd/system/
+```
+
+**Important:** Edit the service files to match your username:
+```bash
+sudo nano /etc/systemd/system/streamzio.service
+sudo nano /etc/systemd/system/streamzio-tunnel.service
+```
+
+Change `User=julien` to your actual username if different.
+
+### Step 3: Enable and Start Services
+
+```bash
+# Reload systemd to recognize new services
+sudo systemctl daemon-reload
+
+# Enable services to start on boot
+sudo systemctl enable streamzio
+sudo systemctl enable streamzio-tunnel
+
+# Start the services now
+sudo systemctl start streamzio
+sudo systemctl start streamzio-tunnel
+```
+
+### Step 4: Check Service Status
+
+```bash
+# Check main service status
+sudo systemctl status streamzio
+
+# Check tunnel service status
+sudo systemctl status streamzio-tunnel
+```
+
+**To view logs:**
+```bash
+# Main service logs
+sudo journalctl -u streamzio -f
+
+# Tunnel service logs (to see your tunnel URL)
+sudo journalctl -u streamzio-tunnel -f
+
+# Press Ctrl + C to exit log view
+```
+
+**To get your tunnel URL:**
+```bash
+sudo journalctl -u streamzio-tunnel -n 50 | grep "https://"
+```
+
+Or check your `config.json`:
+```bash
+cat /opt/streamzio/config.json | grep publicBaseUrl
+```
+
+The tunnel URL will be automatically saved to `config.json`. Your unique subdomain will be something like `streamzio-raspberry-pi-abc123.loca.lt`.
+
+**Note:** The tunnel service automatically generates a fixed subdomain based on your device hostname and a unique hash, so the URL stays the same across restarts.
+
 ## Raspberry Pi Setup
 
 For Raspberry Pi, install Chromium:

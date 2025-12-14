@@ -6,4 +6,5 @@ config.json
 __pycache__/
 *.pyc
 debug_multiup.html
+.device-id
 

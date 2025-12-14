@@ -1,0 +1,18 @@
+[Unit]
+Description=Streamzio Stremio Addon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=julien
+WorkingDirectory=/opt/streamzio
+ExecStart=/usr/bin/npm start
+Restart=on-failure
+RestartSec=10
+Environment=NODE_ENV=production
+Environment=PATH=/usr/bin:/usr/local/bin
+
+[Install]
+WantedBy=multi-user.target
+
