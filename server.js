@@ -928,8 +928,6 @@ async function startServer() {
                 // Update dynamic base URL based on the request
                 // This ensures logo uses the correct host and protocol
                 dynamicBaseUrl = `${proto}://${host}`;
-                // Update manifest logo URL dynamically
-                manifest.logo = `${dynamicBaseUrl}/logo.jpg`;
             }
         } catch (_e) {}
         next();
@@ -937,6 +935,16 @@ async function startServer() {
     
     // Serve static files (logo, etc.)
     app.use(express.static(__dirname));
+    
+    // Custom manifest.json route with dynamic logo URL
+    app.get('/manifest.json', (req, res) => {
+        const baseUrl = getPublicBaseUrl();
+        const dynamicManifest = {
+            ...manifest,
+            logo: `${baseUrl}/logo.jpg`
+        };
+        res.json(dynamicManifest);
+    });
     
     // Mount Stremio addon router
     const addonInterface = builder.getInterface();
