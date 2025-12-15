@@ -466,19 +466,18 @@ async function getTitleFromImdbId(imdbId, type) {
 
 // Helper function to format title for search
 function formatTitleForSearch(title, season, episode) {
-    // Normalize title: remove special chars, replace spaces with dots
+    // Replace special characters with spaces for better matching
     let searchTitle = title
-        .replace(/[^\w\s]/g, '')
-        .replace(/\s+/g, '.')
-        .replace(/\.+/g, '.')
-        .replace(/^\.|\.$/g, '')
-        .toUpperCase();
+        .replace(/[^\w\s]/g, ' ')  // Replace special chars with spaces
+        .replace(/\s+/g, ' ')       // Normalize multiple spaces to single space
+        .trim();
     
     // Format season and episode as SxxExx
     const seasonStr = season.toString().padStart(2, '0');
     const episodeStr = episode.toString().padStart(2, '0');
     
-    return `${searchTitle}.S${seasonStr}E${episodeStr}.FLEMISH`;
+    // Search with title + season/episode, scnlog.me will handle the matching
+    return `${searchTitle} S${seasonStr}E${episodeStr}`;
 }
 
 // Search scnlog.me for content
@@ -493,7 +492,7 @@ async function searchScnlog(title, season, episode) {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             },
-            timeout: 30000
+            timeout: 15000  // Reduced from 30s to 15s for faster failure
         });
         
         const $ = cheerio.load(response.data);
@@ -501,7 +500,16 @@ async function searchScnlog(title, season, episode) {
         // Find the first matching post link
         let postUrl = null;
         const titleLower = title.toLowerCase();
-        const searchPattern = new RegExp(`S${season.toString().padStart(2, '0')}E${episode.toString().padStart(2, '0')}`, 'i');
+        // Extract key words from title (remove common words, keep important ones)
+        const titleWords = titleLower
+            .split(/\s+/)
+            .filter(word => word.length > 2) // Filter out short words like "de", "the", etc.
+            .filter(word => !['the', 'and', 'or', 'but', 'for', 'with'].includes(word));
+        
+        // Season/episode pattern - flexible matching (S01E08, S1E8, etc.)
+        const seasonStr = season.toString().padStart(2, '0');
+        const episodeStr = episode.toString().padStart(2, '0');
+        const searchPattern = new RegExp(`S0?${season}[Ee]0?${episode}`, 'i');
         
         $('a').each((i, elem) => {
             const href = $(elem).attr('href');
@@ -509,13 +517,18 @@ async function searchScnlog(title, season, episode) {
             
             if (href && href.includes('/foreign/')) {
                 const textLower = text.toLowerCase();
-                // Check if title matches (flexible matching)
-                const titleMatch = titleLower.split(' ').every(word => 
-                    word.length > 2 ? textLower.includes(word) : true
-                );
                 
-                // Check if it matches the season/episode pattern
-                if (titleMatch && searchPattern.test(text)) {
+                // Check if it matches the season/episode pattern first (most important)
+                if (!searchPattern.test(text)) {
+                    return; // Skip if season/episode doesn't match
+                }
+                
+                // Check if title words match (flexible - at least 2 key words should match)
+                const matchingWords = titleWords.filter(word => textLower.includes(word));
+                
+                // If we have at least 2 matching words OR if title is short and at least 1 word matches
+                if (matchingWords.length >= Math.min(2, titleWords.length) || 
+                    (titleWords.length <= 2 && matchingWords.length >= 1)) {
                     postUrl = href.startsWith('http') ? href : `https://scnlog.me${href}`;
                     return false; // break
                 }
@@ -852,6 +865,7 @@ async function getRealDebridStream(link, apiKey) {
 
 // Stream Handler
 builder.defineStreamHandler(async ({ type, id }) => {
+    const requestStartTime = Date.now();
     console.log(`\n📺 Stream request received: type=${type}, id=${id}`);
     
     const config = getConfig();
@@ -882,7 +896,8 @@ builder.defineStreamHandler(async ({ type, id }) => {
             if (imdbId.startsWith('tt')) {
                 const cachedStreams = getCachedStreams(imdbId, season, episode);
                 if (cachedStreams) {
-                    console.log(`⚡ Returning ${cachedStreams.length} cached streams for ${imdbId} S${season}E${episode}`);
+                    const cacheTime = Date.now() - requestStartTime;
+                    console.log(`⚡ Returning ${cachedStreams.length} cached streams for ${imdbId} S${season}E${episode} (${cacheTime}ms)`);
                     return Promise.resolve({ streams: cachedStreams });
                 }
             }
@@ -909,13 +924,19 @@ builder.defineStreamHandler(async ({ type, id }) => {
             console.log(`🎬 Processing: ${title} S${season}E${episode}`);
             
             // Search scnlog.me
+            const searchStartTime = Date.now();
             const postUrl = await searchScnlog(title, season, episode);
+            const searchTime = Date.now() - searchStartTime;
+            console.log(`⏱️  Search took ${searchTime}ms`);
             if (!postUrl) {
                 return Promise.resolve({ streams: [] });
             }
             
             // Extract MultiUp link
+            const extractStartTime = Date.now();
             const multiUpLink = await extractMultiUpLink(postUrl);
+            const extractTime = Date.now() - extractStartTime;
+            console.log(`⏱️  MultiUp extraction took ${extractTime}ms`);
             if (!multiUpLink) {
                 return Promise.resolve({ streams: [] });
             }
@@ -932,7 +953,10 @@ builder.defineStreamHandler(async ({ type, id }) => {
             }
             
             // Extract hoster links with metadata
+            const hosterStartTime = Date.now();
             const { links: hosterLinks, metadata } = await extractHosterLinks(multiUpLink, postTitle);
+            const hosterTime = Date.now() - hosterStartTime;
+            console.log(`⏱️  Hoster extraction took ${hosterTime}ms`);
             if (hosterLinks.length === 0) {
                 return Promise.resolve({ streams: [] });
             }
@@ -949,6 +973,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
             const scenegroupDisplay = metadata.scenegroup || 'Unknown';
             
             // Get Real-Debrid streams - try all hoster links
+            const rdStartTime = Date.now();
             const streams = [];
             for (const hosterLink of hosterLinks) {
                 try {
@@ -992,6 +1017,11 @@ builder.defineStreamHandler(async ({ type, id }) => {
             if (imdbId.startsWith('tt') && streams.length > 0) {
                 setCachedStreams(imdbId, season, episode, streams);
             }
+            
+            const rdTime = Date.now() - rdStartTime;
+            const totalTime = Date.now() - requestStartTime;
+            console.log(`⏱️  Real-Debrid processing took ${rdTime}ms`);
+            console.log(`⏱️  Total request time: ${totalTime}ms`);
             
             return Promise.resolve({ streams });
         } else if (type === 'movie' && parts.length >= 2) {
