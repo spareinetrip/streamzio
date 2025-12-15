@@ -6,6 +6,7 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const { getConfig } = require('./config');
 const { execSync } = require('child_process');
+const { getCachedStreams, setCachedStreams } = require('./cache');
 
 // Use stealth plugin to bypass Cloudflare detection
 puppeteer.use(StealthPlugin());
@@ -871,6 +872,21 @@ builder.defineStreamHandler(async ({ type, id }) => {
             const season = parseInt(parts[parts.length - 2]);
             const episode = parseInt(parts[parts.length - 1]);
             
+            // Validate season and episode
+            if (isNaN(season) || isNaN(episode) || season < 1 || episode < 1) {
+                console.log(`❌ Invalid season/episode: S${season}E${episode}`);
+                return Promise.resolve({ streams: [] });
+            }
+            
+            // Check cache first (only for IMDB IDs)
+            if (imdbId.startsWith('tt')) {
+                const cachedStreams = getCachedStreams(imdbId, season, episode);
+                if (cachedStreams) {
+                    console.log(`⚡ Returning ${cachedStreams.length} cached streams for ${imdbId} S${season}E${episode}`);
+                    return Promise.resolve({ streams: cachedStreams });
+                }
+            }
+            
             // Check if it's an IMDB ID (starts with "tt")
             let title = null;
             if (imdbId.startsWith('tt')) {
@@ -883,12 +899,6 @@ builder.defineStreamHandler(async ({ type, id }) => {
             } else {
                 // Title-based ID
                 title = parts.slice(0, -2).join(':'); // Handle titles with colons
-            }
-            
-            // Validate season and episode
-            if (isNaN(season) || isNaN(episode) || season < 1 || episode < 1) {
-                console.log(`❌ Invalid season/episode: S${season}E${episode}`);
-                return Promise.resolve({ streams: [] });
             }
             
             if (!title) {
@@ -976,6 +986,11 @@ builder.defineStreamHandler(async ({ type, id }) => {
                     console.log(`⚠️  Failed to get stream from ${hosterLink.host}: ${error.message}`);
                     // Continue to next hoster
                 }
+            }
+            
+            // Cache the streams if we have an IMDB ID and got results
+            if (imdbId.startsWith('tt') && streams.length > 0) {
+                setCachedStreams(imdbId, season, episode, streams);
             }
             
             return Promise.resolve({ streams });
