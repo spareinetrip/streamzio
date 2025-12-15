@@ -16,9 +16,9 @@ const CINEMETA_API_URL = 'https://v3-cinemeta.strem.io';
 const manifest = {
     id: 'org.streamzio.flemish',
     version: '1.0.0',
-    name: 'Streamzio - Flemish Content',
+    name: 'Streamzio',
     description: 'Flemish content from scnlog.me with Real-Debrid integration',
-    logo: 'https://via.placeholder.com/150',
+    logo: 'http://127.0.0.1:7004/logo.jpg', // Will be updated dynamically based on port
     background: '',
     types: ['series', 'movie'],
     catalogs: [],
@@ -891,7 +891,14 @@ async function startServer() {
     });
     
     const httpPort = config.server.port || 7004;
+    
+    // Update manifest logo URL with correct port
+    manifest.logo = `http://127.0.0.1:${httpPort}/logo.jpg`;
+    
     const app = express();
+    
+    // Serve static files (logo, etc.)
+    app.use(express.static(__dirname));
     
     // Mount Stremio addon router
     const addonInterface = builder.getInterface();
@@ -911,7 +918,7 @@ async function startServer() {
     app.get('/', (req, res) => {
         res.json({
             status: 'online',
-            service: 'Streamzio - Flemish Content',
+            service: 'Streamzio',
             version: manifest.version,
             port: httpPort,
             endpoints: {
