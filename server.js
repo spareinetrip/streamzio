@@ -5,6 +5,7 @@ const cheerio = require('cheerio');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const { getConfig } = require('./config');
+const { execSync } = require('child_process');
 
 // Use stealth plugin to bypass Cloudflare detection
 puppeteer.use(StealthPlugin());
@@ -92,6 +93,85 @@ function findBrowserExecutable() {
     return null;
 }
 
+// Check if X11 display is available (even if DISPLAY env var is not set)
+function detectDisplay() {
+    // First check if DISPLAY env var is set
+    if (process.env.DISPLAY && process.env.DISPLAY !== '') {
+        return process.env.DISPLAY;
+    }
+    
+    // Check if running on Wayland (XWayland provides X11 compatibility)
+    const waylandDisplay = process.env.WAYLAND_DISPLAY;
+    const xdgSessionType = process.env.XDG_SESSION_TYPE;
+    
+    if (waylandDisplay || xdgSessionType === 'wayland') {
+        console.log(`   🔍 Detected Wayland session - checking for XWayland...`);
+        // On Wayland, XWayland typically uses DISPLAY=:0 or :1
+        // Check for XWayland sockets (doesn't require xdpyinfo)
+        for (let i = 0; i <= 2; i++) {
+            const xwaylandSocket = `/tmp/.X11-unix/X${i}`;
+            if (fs.existsSync(xwaylandSocket)) {
+                console.log(`   ✅ Found XWayland socket - using DISPLAY=:${i}`);
+                return `:${i}`;
+            }
+        }
+        // Try xdpyinfo if available (optional check)
+        for (let i = 0; i <= 2; i++) {
+            try {
+                execSync(`xdpyinfo -display :${i} > /dev/null 2>&1`, { timeout: 1000 });
+                console.log(`   ✅ XWayland display :${i} is accessible`);
+                return `:${i}`;
+            } catch (e) {
+                // xdpyinfo not available or display not accessible
+            }
+        }
+        // If XWayland detection fails, try :0 as default for Wayland
+        // XWayland usually runs on :0 on Wayland systems
+        console.log(`   💡 Wayland detected - will try DISPLAY=:0 (XWayland default)`);
+        return ':0';
+    }
+    
+    // Try to detect X11 display by checking common locations
+    // On Raspberry Pi with desktop environment, X11 usually runs on :0
+    try {
+        // Check if X11 is running by checking for X server socket
+        // Common locations: /tmp/.X11-unix/X0, /tmp/.X0-lock
+        const x11Socket = '/tmp/.X11-unix/X0';
+        const x11Lock = '/tmp/.X0-lock';
+        
+        if (fs.existsSync(x11Socket) || fs.existsSync(x11Lock)) {
+            console.log(`   ✅ Detected X11 display socket - using DISPLAY=:0`);
+            return ':0';
+        }
+        
+        // Alternative: try to run xdpyinfo to check if X11 is accessible
+        // This is more reliable but requires xdpyinfo to be installed
+        try {
+            execSync('xdpyinfo -display :0 > /dev/null 2>&1', { timeout: 1000 });
+            console.log(`   ✅ X11 display :0 is accessible`);
+            return ':0';
+        } catch (e) {
+            // xdpyinfo not available or X11 not accessible
+        }
+        
+        // Check for VNC displays (common on Raspberry Pi)
+        // VNC typically uses :1, :2, etc.
+        for (let i = 1; i <= 10; i++) {
+            try {
+                execSync(`xdpyinfo -display :${i} > /dev/null 2>&1`, { timeout: 500 });
+                console.log(`   ✅ Detected X11 display :${i} (likely VNC)`);
+                return `:${i}`;
+            } catch (e) {
+                // Not this display
+            }
+        }
+    } catch (error) {
+        // If we can't detect, return null (will use headless)
+    }
+    
+    return null;
+}
+
 // Initialize browser instance (reused for speed)
 async function getBrowser() {
     // Return existing browser if available
@@ -127,8 +207,15 @@ async function getBrowser() {
             const cookieDbPath = path.join(userDataDir, 'Default', 'Cookies');
             const hasCookies = fs.existsSync(cookieDbPath);
             
-            // Check if DISPLAY is available (for headless systems like Raspberry Pi without X server)
-            const hasDisplay = process.env.DISPLAY && process.env.DISPLAY !== '';
+            // Detect display (checks DISPLAY env var and X11 availability)
+            const detectedDisplay = detectDisplay();
+            const hasDisplay = detectedDisplay !== null;
+            
+            // Set DISPLAY environment variable if detected but not set
+            if (detectedDisplay && !process.env.DISPLAY) {
+                process.env.DISPLAY = detectedDisplay;
+                console.log(`   🔧 Set DISPLAY=${detectedDisplay} for browser`);
+            }
             
             // Use headless mode if:
             // 1. No display available (headless server), OR
@@ -138,8 +225,10 @@ async function getBrowser() {
             
             if (!hasDisplay) {
                 console.log(`   No DISPLAY detected - using headless mode (required for headless servers)`);
+                console.log(`   💡 Tip: If you have a display available, set DISPLAY in systemd service file`);
             } else {
                 console.log(`   Mode: ${useHeadless ? 'headless' : 'visible'} (cookies exist: ${hasCookies}, challenge detected: ${cloudflareChallengeDetected})`);
+                console.log(`   Display: ${process.env.DISPLAY || detectedDisplay}`);
             }
             
             // Browser args optimized for speed and Raspberry Pi compatibility
@@ -248,8 +337,14 @@ async function fetchMultiUpPage(url) {
         if (pageTitle.includes('Just a moment') || pageContent.includes('challenges.cloudflare.com')) {
             console.log(`⚠️  Cloudflare challenge detected!`);
             
-            // Check if DISPLAY is available
-            const hasDisplay = process.env.DISPLAY && process.env.DISPLAY !== '';
+            // Detect display (checks DISPLAY env var and X11 availability)
+            const detectedDisplay = detectDisplay();
+            const hasDisplay = detectedDisplay !== null;
+            
+            // Set DISPLAY if detected but not set
+            if (detectedDisplay && !process.env.DISPLAY) {
+                process.env.DISPLAY = detectedDisplay;
+            }
             
             // If we're in headless mode and got a challenge, restart in visible mode (only if display is available)
             if (isBrowserHeadless && hasDisplay) {

@@ -238,6 +238,66 @@ The addon will automatically detect Chromium at `/usr/bin/chromium`, `/usr/bin/c
 - On first run, a browser window will open - complete the Cloudflare challenge manually
 - After that, cookies are saved and subsequent requests use headless mode automatically
 
+### Cloudflare challenge on headless server (Raspberry Pi with display)
+If you see "Cloudflare challenge detected but no display available" but you have access to a display through a web portal:
+
+1. **Find your DISPLAY value:**
+   ```bash
+   # Check current DISPLAY (if set)
+   echo $DISPLAY
+   
+   # Check if running Wayland
+   echo $XDG_SESSION_TYPE
+   echo $WAYLAND_DISPLAY
+   
+   # Check for XWayland/X11 sockets (works without xdpyinfo)
+   ls -la /tmp/.X11-unix/ 2>/dev/null || echo "No X11 sockets found"
+   
+   # Check if X11/XWayland is accessible (optional - requires xdpyinfo package)
+   # sudo apt-get install x11-utils  # Install xdpyinfo if needed
+   # xdpyinfo -display :0 2>&1 | head -1
+   
+   # Check if X11 is running (X11 systems)
+   ps aux | grep -E "Xorg|Xwayland" | grep -v grep
+   
+   # Check for VNC displays
+   ps aux | grep vnc | grep -v grep
+   
+   # Common values:
+   # - X11 desktop environment: :0
+   # - Wayland/XWayland: :0 (usually) - check /tmp/.X11-unix/X0
+   # - VNC: :1, :2, etc.
+   ```
+
+2. **Update systemd service file:**
+   ```bash
+   sudo nano /etc/systemd/system/streamzio.service
+   ```
+   
+   Uncomment and set the DISPLAY line:
+   ```ini
+   Environment=DISPLAY=:0
+   ```
+   (Replace `:0` with your actual display number if different. For Wayland systems, XWayland typically uses `:0`)
+
+3. **Reload and restart:**
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl restart streamzio
+   ```
+
+4. **Verify it's working:**
+   ```bash
+   sudo journalctl -u streamzio -f
+   ```
+   
+   You should see: `✅ Detected X11 display socket`, `✅ XWayland display :0 is accessible`, or `✅ X11 display :0 is accessible`
+
+**Note:** 
+- The code now automatically detects X11 and Wayland/XWayland displays, but setting DISPLAY explicitly in the systemd service is more reliable.
+- For Wayland systems, XWayland provides X11 compatibility - Chromium will use XWayland to display windows.
+- If automatic detection fails, manually set `DISPLAY=:0` in the systemd service file.
+
 ## Development
 
 The addon uses:
