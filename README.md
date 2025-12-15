@@ -1,4 +1,4 @@
-# Streamzio - Flemish Content Stremio Addon
+# Streamzio
 
 A Stremio addon that provides Flemish content from scnlog.me with Real-Debrid integration for high-quality streaming.
 

@@ -923,8 +923,10 @@ async function startServer() {
         try {
             const host = req.headers.host;
             if (host) {
-                // Always use HTTP - tunnel services handle HTTPS
-                const proto = 'http';
+                // Detect protocol from request (Localtunnel uses HTTPS)
+                // Check X-Forwarded-Proto header (set by reverse proxies/tunnels)
+                const proto = req.headers['x-forwarded-proto'] || 
+                             (req.secure ? 'https' : 'http');
                 // Update dynamic base URL based on the request
                 // This ensures logo uses the correct host and protocol
                 dynamicBaseUrl = `${proto}://${host}`;
@@ -936,17 +938,28 @@ async function startServer() {
     // Serve static files (logo, etc.)
     app.use(express.static(__dirname));
     
-    // Custom manifest.json route with dynamic logo URL
+    // Custom manifest.json route BEFORE router (to serve dynamic logo URL)
+    // The router's manifest handler uses cached manifest, so we intercept it
     app.get('/manifest.json', (req, res) => {
         const baseUrl = getPublicBaseUrl();
         const dynamicManifest = {
-            ...manifest,
-            logo: `${baseUrl}/logo.jpg`
+            id: manifest.id,
+            version: manifest.version,
+            name: manifest.name,
+            description: manifest.description,
+            logo: `${baseUrl}/logo.jpg`,
+            background: manifest.background,
+            types: manifest.types,
+            catalogs: manifest.catalogs,
+            resources: manifest.resources,
+            idPrefixes: manifest.idPrefixes
         };
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Access-Control-Allow-Origin', '*');
         res.json(dynamicManifest);
     });
     
-    // Mount Stremio addon router
+    // Mount Stremio addon router (handles resource endpoints)
     const addonInterface = builder.getInterface();
     const router = getRouter(addonInterface);
     app.use(router);
