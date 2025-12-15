@@ -12,13 +12,38 @@ puppeteer.use(StealthPlugin());
 const REALDEBRID_API_URL = 'https://api.real-debrid.com/rest/1.0';
 const CINEMETA_API_URL = 'https://v3-cinemeta.strem.io';
 
+// Dynamic base URL - updated from requests
+let dynamicBaseUrl = null;
+
+// Helper to check if host is localhost
+function isLocalhost(host) {
+    if (!host) return true;
+    const hostname = host.split(':')[0];
+    return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+}
+
+function getPublicBaseUrl() {
+    const config = getConfig();
+    // Use configured base URL if set
+    if (config.server.publicBaseUrl) {
+        return config.server.publicBaseUrl;
+    }
+    // Use dynamically detected base URL from requests
+    if (dynamicBaseUrl) {
+        return dynamicBaseUrl;
+    }
+    // Fallback to localhost (HTTP for localhost)
+    const httpPort = config.server.port || 7004;
+    return `http://localhost:${httpPort}`;
+}
+
 // Addon Manifest
 const manifest = {
     id: 'org.streamzio.flemish',
     version: '1.0.0',
     name: 'Streamzio',
     description: 'Flemish content from scnlog.me with Real-Debrid integration',
-    logo: 'http://127.0.0.1:7004/logo.jpg', // Will be updated dynamically based on port
+    logo: 'http://localhost:7004/logo.jpg', // Will be updated dynamically
     background: '',
     types: ['series', 'movie'],
     catalogs: [],
@@ -891,11 +916,24 @@ async function startServer() {
     });
     
     const httpPort = config.server.port || 7004;
-    
-    // Update manifest logo URL with correct port
-    manifest.logo = `http://127.0.0.1:${httpPort}/logo.jpg`;
-    
     const app = express();
+    
+    // Dynamic base URL detection from requests
+    app.use((req, _res, next) => {
+        try {
+            const host = req.headers.host;
+            if (host) {
+                // Always use HTTP - tunnel services handle HTTPS
+                const proto = 'http';
+                // Update dynamic base URL based on the request
+                // This ensures logo uses the correct host and protocol
+                dynamicBaseUrl = `${proto}://${host}`;
+                // Update manifest logo URL dynamically
+                manifest.logo = `${dynamicBaseUrl}/logo.jpg`;
+            }
+        } catch (_e) {}
+        next();
+    });
     
     // Serve static files (logo, etc.)
     app.use(express.static(__dirname));
