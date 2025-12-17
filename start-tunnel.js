@@ -385,6 +385,7 @@ function startTunnelInternal(deviceId, port, retryCount, maxRetries) {
     let errorMessage = '';
     let urlVerified = false;
     let isShuttingDown = false; // Track if we're shutting down gracefully
+    let shutdownTimeout = null; // Track shutdown timeout
     
     // Parse tunnel URL from output
     let outputBuffer = '';
@@ -430,30 +431,34 @@ function startTunnelInternal(deviceId, port, retryCount, maxRetries) {
                         
                         // VERIFY URL MATCHES EXPECTED SUBDOMAIN
                         if (!verifyTunnelUrl(tunnelUrl, deviceId)) {
-                            console.error(`\n❌ Tunnel started with wrong URL! Killing process...`);
+                            console.error(`\n❌ Tunnel started with wrong URL! Shutting down gracefully...`);
                             hasError = true;
                             errorMessage = `Tunnel URL does not match expected subdomain: ${deviceId}`;
                             urlUpdated = true; // Set to true to prevent further processing
                             
-                            // Kill the process immediately
-                            setTimeout(() => {
-                                if (lt && !lt.killed) {
-                                    try {
-                                        process.kill(-lt.pid, 'SIGTERM');
-                                    } catch (e) {
-                                        lt.kill('SIGTERM');
-                                    }
-                                    setTimeout(() => {
-                                        if (lt && !lt.killed) {
-                                            try {
-                                                process.kill(-lt.pid, 'SIGKILL');
-                                            } catch (e) {
-                                                lt.kill('SIGKILL');
-                                            }
-                                        }
-                                    }, 2000);
+                            // Kill the process gracefully to allow server-side cleanup
+                            if (lt && !lt.killed && lt.pid) {
+                                console.log(`   Sending SIGTERM to tunnel process ${lt.pid} for graceful shutdown...`);
+                                try {
+                                    process.kill(-lt.pid, 'SIGTERM'); // Kill process group
+                                } catch (e) {
+                                    lt.kill('SIGTERM');
                                 }
-                            }, 500);
+                                
+                                // Wait for graceful shutdown, then force kill if needed
+                                setTimeout(() => {
+                                    if (lt && !lt.killed) {
+                                        console.log(`   Force killing tunnel process...`);
+                                        try {
+                                            process.kill(-lt.pid, 'SIGKILL');
+                                        } catch (e) {
+                                            lt.kill('SIGKILL');
+                                        }
+                                    }
+                                    // Wait for server-side cleanup before retry
+                                    console.log(`   Waiting for subdomain to be released on server...`);
+                                }, 8000); // Give time for graceful shutdown
+                            }
                             return;
                         }
                         
@@ -506,12 +511,34 @@ function startTunnelInternal(deviceId, port, retryCount, maxRetries) {
                 // Exponential backoff: 5s, 10s, 15s (longer to allow subdomain to be released)
                 const baseDelay = 5000; // Start with 5 seconds
                 const backoffDelay = baseDelay * (retryCount + 1) + Math.random() * 2000;
-                console.log(`\n🔄 Retrying in ${Math.round(backoffDelay/1000)} seconds (allowing time for subdomain release)...`);
+                
+                // If URL verification failed, add extra wait time for server-side cleanup
+                const extraWaitTime = (!urlVerified && urlUpdated) ? 10000 : 0;
+                const totalDelay = backoffDelay + extraWaitTime;
+                
+                if (extraWaitTime > 0) {
+                    console.log(`\n🔄 Retrying in ${Math.round(totalDelay/1000)} seconds (${Math.round(backoffDelay/1000)}s backoff + ${Math.round(extraWaitTime/1000)}s for subdomain release)...`);
+                } else {
+                    console.log(`\n🔄 Retrying in ${Math.round(backoffDelay/1000)} seconds (allowing time for subdomain release)...`);
+                }
+                
                 setTimeout(async () => {
+                    // Always cleanup stale processes before retry
                     await cleanupStaleProcesses(deviceId, port);
+                    
+                    // If URL verification failed, also check if subdomain is still active
+                    if (!urlVerified && urlUpdated) {
+                        console.log(`🔍 Checking if subdomain ${deviceId} is still active after cleanup...`);
+                        const isActive = await checkSubdomainActive(deviceId);
+                        if (isActive) {
+                            console.log(`⚠️  Subdomain ${deviceId} is still active! Waiting additional 10 seconds...`);
+                            await new Promise(resolve => setTimeout(resolve, 10000));
+                        }
+                    }
+                    
                     // Retry - lock is already held, don't acquire again
                     startTunnelInternal(deviceId, port, retryCount + 1, maxRetries);
-                }, backoffDelay);
+                }, totalDelay);
             } else {
                 // Final failure - release lock
                 releaseLock();

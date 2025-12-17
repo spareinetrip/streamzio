@@ -24,13 +24,26 @@ TUNNEL_PID=""
 cleanup() {
     echo "🛑 Shutting down streamzio..."
     
-    # Kill tunnel first
+    # Kill tunnel first - give it time to shutdown gracefully
     if [ -n "$TUNNEL_PID" ] && kill -0 "$TUNNEL_PID" 2>/dev/null; then
         echo "   Stopping tunnel (PID: $TUNNEL_PID)..."
+        # Send SIGTERM first to allow graceful shutdown
         kill -TERM "$TUNNEL_PID" 2>/dev/null || true
-        sleep 2
+        
+        # Wait up to 10 seconds for graceful shutdown
+        WAIT_COUNT=0
+        while [ $WAIT_COUNT -lt 10 ] && kill -0 "$TUNNEL_PID" 2>/dev/null; do
+            sleep 1
+            WAIT_COUNT=$((WAIT_COUNT + 1))
+        done
+        
+        # Force kill if still running
         if kill -0 "$TUNNEL_PID" 2>/dev/null; then
+            echo "   Force killing tunnel process..."
             kill -KILL "$TUNNEL_PID" 2>/dev/null || true
+            sleep 1
+        else
+            echo "   Tunnel stopped gracefully"
         fi
     fi
     
@@ -45,32 +58,43 @@ cleanup() {
         fi
         
         # Find localtunnel processes using our port OR subdomain
-        pgrep -f "lt --port" | while read pid; do
+        # Collect PIDs first (while loop in subshell doesn't work well)
+        PIDS_TO_KILL=""
+        for pid in $(pgrep -f "lt --port" 2>/dev/null || true); do
             cmdline=$(ps -p "$pid" -o args= 2>/dev/null || echo "")
             if [ -n "$cmdline" ]; then
                 # Check if it uses our port
                 if echo "$cmdline" | grep -q "lt.*--port.*${PORT}"; then
-                    echo "   Stopping localtunnel process ${pid} on port ${PORT}..."
-                    kill -TERM "$pid" 2>/dev/null || true
+                    echo "   Found localtunnel process ${pid} on port ${PORT}"
+                    PIDS_TO_KILL="$PIDS_TO_KILL $pid"
                 # Check if it uses our subdomain (if we have one)
                 elif [ -n "$DEVICE_ID" ] && echo "$cmdline" | grep -q "lt.*--subdomain.*${DEVICE_ID}"; then
-                    echo "   Stopping localtunnel process ${pid} using subdomain ${DEVICE_ID}..."
+                    echo "   Found localtunnel process ${pid} using subdomain ${DEVICE_ID}"
+                    PIDS_TO_KILL="$PIDS_TO_KILL $pid"
+                fi
+            fi
+        done
+        
+        # Kill collected PIDs
+        if [ -n "$PIDS_TO_KILL" ]; then
+            for pid in $PIDS_TO_KILL; do
+                if kill -0 "$pid" 2>/dev/null; then
+                    echo "   Stopping localtunnel process ${pid}..."
                     kill -TERM "$pid" 2>/dev/null || true
                 fi
-            fi
-        done
-        sleep 2  # Give processes time to shutdown gracefully
-        # Force kill any remaining
-        pgrep -f "lt --port" | while read pid; do
-            cmdline=$(ps -p "$pid" -o args= 2>/dev/null || echo "")
-            if [ -n "$cmdline" ]; then
-                if echo "$cmdline" | grep -q "lt.*--port.*${PORT}"; then
-                    kill -KILL "$pid" 2>/dev/null || true
-                elif [ -n "$DEVICE_ID" ] && echo "$cmdline" | grep -q "lt.*--subdomain.*${DEVICE_ID}"; then
+            done
+            
+            # Wait for graceful shutdown
+            sleep 3
+            
+            # Force kill any remaining
+            for pid in $PIDS_TO_KILL; do
+                if kill -0 "$pid" 2>/dev/null; then
+                    echo "   Force killing localtunnel process ${pid}..."
                     kill -KILL "$pid" 2>/dev/null || true
                 fi
-            fi
-        done
+            done
+        fi
     fi
     
     # Kill streamzio
