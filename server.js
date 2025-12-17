@@ -64,6 +64,12 @@ let browserInitializing = false;
 let browserInitPromise = null;
 let cloudflareChallengeDetected = false;  // Track if Cloudflare challenge was detected
 let isBrowserHeadless = false;  // Track if current browser is in headless mode
+let activePages = new Set();  // Track active pages for cleanup
+let isShuttingDown = false;  // Track if we're shutting down
+let requestQueue = [];  // Queue for browser requests to prevent overload
+let maxConcurrentRequests = 2;  // Maximum concurrent browser operations
+let activeRequestCount = 0;  // Current active browser operations
+const MAX_PAGES_PER_BROWSER = 10;  // Maximum pages to prevent memory issues
 
 // Find Chrome/Chromium executable (works on macOS, Linux, Raspberry Pi)
 function findBrowserExecutable() {
@@ -175,9 +181,27 @@ function detectDisplay() {
 
 // Initialize browser instance (reused for speed)
 async function getBrowser() {
-    // Return existing browser if available
+    // Return existing browser if available and healthy
     if (globalBrowser && globalBrowser.isConnected()) {
-        return globalBrowser;
+        try {
+            // Verify browser is actually working by checking pages
+            const pages = await globalBrowser.pages();
+            // If we have too many pages, something is wrong - reset browser
+            if (pages.length > MAX_PAGES_PER_BROWSER) {
+                console.log(`⚠️  Too many pages (${pages.length}), resetting browser...`);
+                try {
+                    await globalBrowser.close();
+                } catch (e) {}
+                globalBrowser = null;
+                activePages.clear();
+            } else {
+                return globalBrowser;
+            }
+        } catch (error) {
+            console.log(`⚠️  Browser connection check failed: ${error.message}, reinitializing...`);
+            globalBrowser = null;
+            activePages.clear();
+        }
     }
     
     // If already initializing, wait for that promise
@@ -274,7 +298,14 @@ async function getBrowser() {
             
             // Handle browser disconnection
             globalBrowser.on('disconnected', () => {
-                console.log(`⚠️  Browser disconnected, will reinitialize on next request`);
+                console.log(`⚠️  Browser disconnected, cleaning up and will reinitialize on next request`);
+                // Close all active pages
+                activePages.forEach(page => {
+                    try {
+                        page.close().catch(() => {});
+                    } catch (e) {}
+                });
+                activePages.clear();
                 globalBrowser = null;
                 browserInitializing = false;
                 browserInitPromise = null;
@@ -294,24 +325,103 @@ async function getBrowser() {
     return await browserInitPromise;
 }
 
+// Periodic cleanup of orphaned pages (every 5 minutes)
+function startPeriodicCleanup() {
+    setInterval(async () => {
+        if (!globalBrowser || !globalBrowser.isConnected()) {
+            activePages.clear();
+            return;
+        }
+        
+        try {
+            const browserPages = await globalBrowser.pages();
+            const browserPageIds = new Set(browserPages.map(p => p.url()));
+            
+            // Remove pages from activePages that are no longer in browser
+            for (const page of Array.from(activePages)) {
+                try {
+                    if (page.isClosed() || !browserPageIds.has(page.url())) {
+                        activePages.delete(page);
+                    }
+                } catch (e) {
+                    activePages.delete(page);
+                }
+            }
+            
+            // Log if we found orphaned pages
+            if (activePages.size !== browserPages.length) {
+                console.log(`🧹 Cleaned up ${browserPages.length - activePages.size} orphaned pages`);
+            }
+        } catch (error) {
+            console.log(`⚠️  Error during periodic cleanup: ${error.message}`);
+        }
+    }, 5 * 60 * 1000); // Every 5 minutes
+}
+
 // Pre-start browser on server startup for faster first request
 async function preStartBrowser() {
     try {
         console.log(`🚀 Pre-starting browser for faster first request...`);
         await getBrowser();
         console.log(`✅ Browser pre-started successfully`);
+        
+        // Start periodic cleanup
+        startPeriodicCleanup();
     } catch (error) {
         console.log(`⚠️  Browser pre-start failed (will start on first request): ${error.message}`);
     }
 }
 
+// Helper function to wait for available slot in request queue
+async function waitForBrowserSlot() {
+    while (activeRequestCount >= maxConcurrentRequests) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    activeRequestCount++;
+}
+
+// Helper function to release browser slot
+function releaseBrowserSlot() {
+    activeRequestCount = Math.max(0, activeRequestCount - 1);
+}
+
 // Fetch MultiUp page using Puppeteer (handles Cloudflare automatically)
 async function fetchMultiUpPage(url) {
-    let browser = await getBrowser();
-    let page = await browser.newPage();
+    let browser = null;
+    let page = null;
     let needsVisibleBrowser = false;
     
+    // Wait for available slot
+    await waitForBrowserSlot();
+    
     try {
+        browser = await getBrowser();
+        
+        // Check if browser is still connected
+        if (!browser.isConnected()) {
+            throw new Error('Browser disconnected');
+        }
+        
+        // Check page limit before creating new page
+        const currentPages = await browser.pages();
+        if (currentPages.length >= MAX_PAGES_PER_BROWSER) {
+            throw new Error(`Too many pages (${currentPages.length}), cannot create new page`);
+        }
+        
+        page = await browser.newPage();
+        activePages.add(page);
+        
+        // Set page timeout to prevent hanging
+        page.setDefaultTimeout(60000);
+        
+        // Handle page errors
+        page.on('error', (error) => {
+            console.log(`⚠️  Page error: ${error.message}`);
+        });
+        
+        page.on('pageerror', (error) => {
+            console.log(`⚠️  Page JS error: ${error.message}`);
+        });
         console.log(`📄 Fetching page with Puppeteer: ${url}`);
         
         // Set realistic browser properties (optimized)
@@ -353,9 +463,33 @@ async function fetchMultiUpPage(url) {
                 cloudflareChallengeDetected = true;
                 needsVisibleBrowser = true;
                 
-                // Close current browser and page
-                await page.close();
-                await browser.close();
+                // Clean up current page
+                if (page) {
+                    activePages.delete(page);
+                    try {
+                        if (!page.isClosed()) {
+                            await page.close();
+                        }
+                    } catch (e) {}
+                }
+                
+                // Close current browser and clean up all pages
+                if (browser && browser.isConnected()) {
+                    // Close all pages before closing browser
+                    try {
+                        const pages = await browser.pages();
+                        for (const p of pages) {
+                            activePages.delete(p);
+                            try {
+                                if (!p.isClosed()) {
+                                    await p.close();
+                                }
+                            } catch (e) {}
+                        }
+                    } catch (e) {}
+                    await browser.close();
+                }
+                
                 globalBrowser = null;
                 browserInitializing = false;
                 browserInitPromise = null;
@@ -363,7 +497,23 @@ async function fetchMultiUpPage(url) {
                 
                 // Get new browser in visible mode
                 browser = await getBrowser();
+                
+                // Check if browser is still connected
+                if (!browser.isConnected()) {
+                    throw new Error('Browser disconnected after restart');
+                }
+                
                 page = await browser.newPage();
+                activePages.add(page);
+                
+                // Set page timeout and error handlers again
+                page.setDefaultTimeout(60000);
+                page.on('error', (error) => {
+                    console.log(`⚠️  Page error: ${error.message}`);
+                });
+                page.on('pageerror', (error) => {
+                    console.log(`⚠️  Page JS error: ${error.message}`);
+                });
                 
                 // Set properties again
                 await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
@@ -439,8 +589,22 @@ async function fetchMultiUpPage(url) {
         // Cookies are automatically saved to .browser-data by Puppeteer
         
         return pageHtml;
+    } catch (error) {
+        console.error(`❌ Error fetching MultiUp page: ${error.message}`);
+        throw error;
     } finally {
-        await page.close();
+        // Always cleanup page
+        if (page) {
+            try {
+                activePages.delete(page);
+                if (!page.isClosed()) {
+                    await page.close().catch(() => {});
+                }
+            } catch (e) {
+                // Ignore cleanup errors
+            }
+        }
+        releaseBrowserSlot();
     }
 }
 
@@ -863,18 +1027,56 @@ async function getRealDebridStream(link, apiKey) {
     }
 }
 
+// Helper function to wrap async operations with timeout
+function withTimeout(promise, timeoutMs, operationName) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => {
+            setTimeout(() => {
+                reject(new Error(`${operationName} timed out after ${timeoutMs}ms`));
+            }, timeoutMs);
+        })
+    ]);
+}
+
 // Stream Handler
 builder.defineStreamHandler(async ({ type, id }) => {
     const requestStartTime = Date.now();
     console.log(`\n📺 Stream request received: type=${type}, id=${id}`);
     
+    // Check if we're shutting down
+    if (isShuttingDown) {
+        console.log('⚠️  Server is shutting down, rejecting request');
+        return { streams: [] };
+    }
+    
     const config = getConfig();
     
     if (!config.realdebrid.apiKey || !config.realdebrid.enabled) {
         console.log('⚠️  Real-Debrid not configured');
-        return Promise.resolve({ streams: [] });
+        return { streams: [] };
     }
     
+    // Wrap entire handler in timeout (120 seconds total)
+    try {
+        return await withTimeout(
+            handleStreamRequest(type, id, requestStartTime, config),
+            120000,
+            'Stream request'
+        );
+    } catch (error) {
+        if (error.message.includes('timed out')) {
+            console.error(`❌ Request timed out: ${error.message}`);
+        } else {
+            console.error(`❌ Error in stream handler: ${error.message}`);
+            console.error('Stack:', error.stack);
+        }
+        return { streams: [] };
+    }
+});
+
+// Actual stream request handler (extracted for timeout wrapper)
+async function handleStreamRequest(type, id, requestStartTime, config) {
     try {
         // Parse the ID to extract title, season, episode
         // Stremio uses IMDB IDs: tt123456:season:episode for series
@@ -889,7 +1091,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
             // Validate season and episode
             if (isNaN(season) || isNaN(episode) || season < 1 || episode < 1) {
                 console.log(`❌ Invalid season/episode: S${season}E${episode}`);
-                return Promise.resolve({ streams: [] });
+                return { streams: [] };
             }
             
             // Check cache first (only for IMDB IDs)
@@ -898,7 +1100,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
                 if (cachedStreams) {
                     const cacheTime = Date.now() - requestStartTime;
                     console.log(`⚡ Returning ${cachedStreams.length} cached streams for ${imdbId} S${season}E${episode} (${cacheTime}ms)`);
-                    return Promise.resolve({ streams: cachedStreams });
+                    return { streams: cachedStreams };
                 }
             }
             
@@ -909,7 +1111,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
                 title = await getTitleFromImdbId(imdbId, type);
                 if (!title) {
                     console.log(`❌ Could not fetch title for IMDB ID: ${imdbId}`);
-                    return Promise.resolve({ streams: [] });
+                    return { streams: [] };
                 }
             } else {
                 // Title-based ID
@@ -918,7 +1120,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
             
             if (!title) {
                 console.log(`❌ No title found in ID: ${id}`);
-                return Promise.resolve({ streams: [] });
+                return { streams: [] };
             }
             
             console.log(`🎬 Processing: ${title} S${season}E${episode}`);
@@ -929,7 +1131,8 @@ builder.defineStreamHandler(async ({ type, id }) => {
             const searchTime = Date.now() - searchStartTime;
             console.log(`⏱️  Search took ${searchTime}ms`);
             if (!postUrl) {
-                return Promise.resolve({ streams: [] });
+                console.log(`✅ Returning empty streams (no post found)`);
+                return { streams: [] };
             }
             
             // Extract MultiUp link
@@ -938,7 +1141,8 @@ builder.defineStreamHandler(async ({ type, id }) => {
             const extractTime = Date.now() - extractStartTime;
             console.log(`⏱️  MultiUp extraction took ${extractTime}ms`);
             if (!multiUpLink) {
-                return Promise.resolve({ streams: [] });
+                console.log(`✅ Returning empty streams (no MultiUp link found)`);
+                return { streams: [] };
             }
             
             // Get post title for metadata extraction (from the actual post heading, not page title)
@@ -958,7 +1162,8 @@ builder.defineStreamHandler(async ({ type, id }) => {
             const hosterTime = Date.now() - hosterStartTime;
             console.log(`⏱️  Hoster extraction took ${hosterTime}ms`);
             if (hosterLinks.length === 0) {
-                return Promise.resolve({ streams: [] });
+                console.log(`✅ Returning empty streams (no hoster links found)`);
+                return { streams: [] };
             }
             
             // Format stream title and subtitle (swapped)
@@ -1022,8 +1227,9 @@ builder.defineStreamHandler(async ({ type, id }) => {
             const totalTime = Date.now() - requestStartTime;
             console.log(`⏱️  Real-Debrid processing took ${rdTime}ms`);
             console.log(`⏱️  Total request time: ${totalTime}ms`);
+            console.log(`✅ Returning ${streams.length} stream(s)`);
             
-            return Promise.resolve({ streams });
+            return { streams };
         } else if (type === 'movie' && parts.length >= 2) {
             const title = parts.slice(1).join(':');
             
@@ -1032,14 +1238,76 @@ builder.defineStreamHandler(async ({ type, id }) => {
             // For movies, search without season/episode
             // This would need a different search strategy
             // For now, return empty
-            return Promise.resolve({ streams: [] });
+            return { streams: [] };
         }
         
-        return Promise.resolve({ streams: [] });
+        return { streams: [] };
     } catch (error) {
         console.error('❌ Error in stream handler:', error);
-        return Promise.resolve({ streams: [] });
+        console.error('Stack:', error.stack);
+        return { streams: [] };
     }
+}
+
+// Graceful shutdown handler
+async function gracefulShutdown() {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    
+    console.log('\n🛑 Starting graceful shutdown...');
+    
+    // Close all active pages
+    const pageClosePromises = Array.from(activePages).map(page => {
+        try {
+            if (!page.isClosed()) {
+                return page.close().catch(() => {});
+            }
+        } catch (e) {
+            return Promise.resolve();
+        }
+    });
+    await Promise.all(pageClosePromises);
+    activePages.clear();
+    
+    // Close browser
+    if (globalBrowser && globalBrowser.isConnected()) {
+        try {
+            console.log('   Closing browser...');
+            await globalBrowser.close();
+            console.log('   Browser closed');
+        } catch (error) {
+            console.log(`   Error closing browser: ${error.message}`);
+        }
+    }
+    
+    globalBrowser = null;
+    browserInitializing = false;
+    browserInitPromise = null;
+    
+    console.log('✅ Graceful shutdown complete');
+}
+
+// Setup signal handlers for graceful shutdown
+process.on('SIGTERM', async () => {
+    await gracefulShutdown();
+    process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+    await gracefulShutdown();
+    process.exit(0);
+});
+
+// Handle uncaught errors
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+    console.error('❌ Uncaught Exception:', error);
+    gracefulShutdown().then(() => {
+        process.exit(1);
+    });
 });
 
 // Start server
@@ -1145,6 +1413,11 @@ async function startServer() {
             console.error('❌ HTTP server error:', error);
             process.exit(1);
         }
+    });
+    
+    // Handle server close
+    server.on('close', async () => {
+        await gracefulShutdown();
     });
 }
 
