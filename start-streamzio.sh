@@ -34,23 +34,41 @@ cleanup() {
         fi
     fi
     
-    # Kill localtunnel processes on our specific port as backup (not all localtunnel processes!)
+    # Kill localtunnel processes on our specific port OR subdomain as backup
+    # This ensures we clean up even if PID tracking fails
     if [ -n "$PORT" ]; then
-        # Find localtunnel processes using our port
-        pgrep -f "lt --port.*${PORT}" | while read pid; do
-            # Verify it's actually using our port
+        # Get device ID from file if it exists
+        DEVICE_ID_FILE="${WORKING_DIR}/.device-id"
+        DEVICE_ID=""
+        if [ -f "$DEVICE_ID_FILE" ]; then
+            DEVICE_ID=$(cat "$DEVICE_ID_FILE" 2>/dev/null || echo "")
+        fi
+        
+        # Find localtunnel processes using our port OR subdomain
+        pgrep -f "lt --port" | while read pid; do
             cmdline=$(ps -p "$pid" -o args= 2>/dev/null || echo "")
-            if echo "$cmdline" | grep -q "lt.*--port.*${PORT}"; then
-                echo "   Stopping localtunnel process ${pid} on port ${PORT}..."
-                kill -TERM "$pid" 2>/dev/null || true
+            if [ -n "$cmdline" ]; then
+                # Check if it uses our port
+                if echo "$cmdline" | grep -q "lt.*--port.*${PORT}"; then
+                    echo "   Stopping localtunnel process ${pid} on port ${PORT}..."
+                    kill -TERM "$pid" 2>/dev/null || true
+                # Check if it uses our subdomain (if we have one)
+                elif [ -n "$DEVICE_ID" ] && echo "$cmdline" | grep -q "lt.*--subdomain.*${DEVICE_ID}"; then
+                    echo "   Stopping localtunnel process ${pid} using subdomain ${DEVICE_ID}..."
+                    kill -TERM "$pid" 2>/dev/null || true
+                fi
             fi
         done
-        sleep 1
-        # Force kill any remaining on our port
-        pgrep -f "lt --port.*${PORT}" | while read pid; do
+        sleep 2  # Give processes time to shutdown gracefully
+        # Force kill any remaining
+        pgrep -f "lt --port" | while read pid; do
             cmdline=$(ps -p "$pid" -o args= 2>/dev/null || echo "")
-            if echo "$cmdline" | grep -q "lt.*--port.*${PORT}"; then
-                kill -KILL "$pid" 2>/dev/null || true
+            if [ -n "$cmdline" ]; then
+                if echo "$cmdline" | grep -q "lt.*--port.*${PORT}"; then
+                    kill -KILL "$pid" 2>/dev/null || true
+                elif [ -n "$DEVICE_ID" ] && echo "$cmdline" | grep -q "lt.*--subdomain.*${DEVICE_ID}"; then
+                    kill -KILL "$pid" 2>/dev/null || true
+                fi
             fi
         done
     fi

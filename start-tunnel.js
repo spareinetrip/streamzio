@@ -535,36 +535,57 @@ function startTunnelInternal(deviceId, port, retryCount, maxRetries) {
         isShuttingDown = true; // Mark that we're shutting down
         clearTimeout(startupTimeout);
         
-        if (lt && !lt.killed) {
-            try {
-                // Kill process group for clean shutdown
-                process.kill(-lt.pid, 'SIGTERM');
-            } catch (e) {
-                lt.kill('SIGTERM');
+        // Set up close handler BEFORE killing (in case process exits quickly)
+        let shutdownComplete = false;
+        const completeShutdown = () => {
+            if (!shutdownComplete) {
+                shutdownComplete = true;
+                releaseLock();
+                process.exit(0);
             }
-            
-            // Give it time to shutdown gracefully
-            const shutdownTimeout = setTimeout(() => {
-                if (lt && !lt.killed) {
-                    try {
-                        process.kill(-lt.pid, 'SIGKILL');
-                    } catch (e) {
-                        lt.kill('SIGKILL');
-                    }
-                }
-                releaseLock();
-                process.exit(0);
-            }, 5000);
-            
-            // If process exits before timeout, clear timeout
+        };
+        
+        // Listen for process exit
+        if (lt) {
             lt.once('close', () => {
-                clearTimeout(shutdownTimeout);
-                releaseLock();
-                process.exit(0);
+                console.log('   Tunnel process closed');
+                completeShutdown();
             });
+        }
+        
+        if (lt && !lt.killed && lt.pid) {
+            try {
+                // Send SIGTERM to allow graceful shutdown
+                // This gives localtunnel time to notify the server and release the subdomain
+                console.log(`   Sending SIGTERM to tunnel process ${lt.pid}...`);
+                try {
+                    process.kill(-lt.pid, 'SIGTERM'); // Kill process group
+                } catch (e) {
+                    lt.kill('SIGTERM');
+                }
+                
+                // Give it more time to shutdown gracefully and release subdomain on server
+                const shutdownTimeout = setTimeout(() => {
+                    if (lt && !lt.killed) {
+                        console.log(`   Force killing tunnel process...`);
+                        try {
+                            process.kill(-lt.pid, 'SIGKILL');
+                        } catch (e) {
+                            lt.kill('SIGKILL');
+                        }
+                    }
+                    // Wait a bit more for server-side cleanup
+                    setTimeout(() => {
+                        completeShutdown();
+                    }, 2000);
+                }, 8000); // Increased from 5s to 8s for better server-side cleanup
+            } catch (e) {
+                console.error(`   Error during shutdown: ${e.message}`);
+                completeShutdown();
+            }
         } else {
-            releaseLock();
-            process.exit(0);
+            // Process already dead or never started
+            completeShutdown();
         }
     };
     
