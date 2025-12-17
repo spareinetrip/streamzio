@@ -55,15 +55,15 @@ function releaseLock() {
     }
 }
 
-// Cleanup stale localtunnel processes - PORT-SPECIFIC VERSION
-// Only kills processes on our specific port to avoid interfering with other addons
+// Cleanup stale localtunnel processes - PORT AND SUBDOMAIN SPECIFIC
+// Kills processes on our port OR using our subdomain to avoid conflicts
 function cleanupStaleProcesses(deviceId, port) {
     try {
-        console.log(`🧹 Cleaning up stale localtunnel processes on port ${port}...`);
+        console.log(`🧹 Cleaning up stale localtunnel processes on port ${port} or subdomain ${deviceId}...`);
         
         const processesToKill = [];
         
-        // Find localtunnel processes that use our specific port
+        // Find localtunnel processes that use our specific port OR our subdomain
         try {
             // First, find all localtunnel processes
             const allLtPids = execSync(`pgrep -f "lt --port"`, { encoding: 'utf8' }).trim();
@@ -71,7 +71,7 @@ function cleanupStaleProcesses(deviceId, port) {
                 allLtPids.split('\n').forEach(pid => {
                     try {
                         const pidNum = parseInt(pid);
-                        // Get command line to check port
+                        // Get command line to check port and subdomain
                         const cmdline = execSync(`ps -p ${pidNum} -o args=`, { encoding: 'utf8' }).trim();
                         
                         // Check if it's a localtunnel process
@@ -80,12 +80,19 @@ function cleanupStaleProcesses(deviceId, port) {
                             const portMatch = cmdline.match(/--port\s+(\d+)/);
                             const processPort = portMatch ? parseInt(portMatch[1]) : null;
                             
-                            // Only kill if it matches our port
+                            // Extract subdomain from command line
+                            const subdomainMatch = cmdline.match(/--subdomain\s+([^\s]+)/);
+                            const processSubdomain = subdomainMatch ? subdomainMatch[1] : null;
+                            
+                            // Kill if it matches our port OR our subdomain
                             if (processPort === port) {
                                 console.log(`   Found localtunnel process ${pidNum} on port ${port}`);
                                 processesToKill.push(pidNum);
+                            } else if (processSubdomain === deviceId) {
+                                console.log(`   Found localtunnel process ${pidNum} using subdomain ${deviceId} (different port: ${processPort})`);
+                                processesToKill.push(pidNum);
                             } else {
-                                console.log(`   Skipping process ${pidNum}: port=${processPort} (different addon)`);
+                                console.log(`   Skipping process ${pidNum}: port=${processPort}, subdomain=${processSubdomain} (different addon)`);
                             }
                         }
                     } catch (e) {
@@ -294,6 +301,39 @@ function verifyTunnelUrl(tunnelUrl, expectedDeviceId) {
     return false;
 }
 
+// Check if subdomain is still active by testing the URL
+async function checkSubdomainActive(deviceId) {
+    try {
+        const testUrl = `https://${deviceId}.loca.lt`;
+        const https = require('https');
+        
+        return new Promise((resolve) => {
+            const req = https.get(testUrl, { timeout: 3000 }, (res) => {
+                // If we get a response, subdomain is still active
+                resolve(true);
+            });
+            
+            req.on('error', (err) => {
+                // Error means subdomain is likely not active
+                resolve(false);
+            });
+            
+            req.on('timeout', () => {
+                req.destroy();
+                resolve(false);
+            });
+            
+            setTimeout(() => {
+                req.destroy();
+                resolve(false);
+            }, 3000);
+        });
+    } catch (error) {
+        // On error, assume subdomain is not active
+        return false;
+    }
+}
+
 // Start Localtunnel with retry logic
 async function startTunnel(retryCount = 0) {
     const MAX_RETRIES = 3;
@@ -312,6 +352,17 @@ async function startTunnel(retryCount = 0) {
         
         // Cleanup stale processes before starting
         await cleanupStaleProcesses(deviceId, port);
+        
+        // Check if subdomain is still active on the server
+        console.log(`🔍 Checking if subdomain ${deviceId} is still active on localtunnel server...`);
+        const isActive = await checkSubdomainActive(deviceId);
+        if (isActive) {
+            console.log(`⚠️  Subdomain ${deviceId} is still active! Waiting for it to be released...`);
+            // Wait a bit longer if subdomain is still active
+            await new Promise(resolve => setTimeout(resolve, 10000));
+        } else {
+            console.log(`✅ Subdomain ${deviceId} appears to be free`);
+        }
     }
     
     startTunnelInternal(deviceId, port, retryCount, MAX_RETRIES);
