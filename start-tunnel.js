@@ -180,28 +180,38 @@ function cleanupStaleProcesses(deviceId, port) {
             console.log(`   No localtunnel processes found on port ${port}`);
         }
         
-        // Wait a bit for all processes to die
+        // Wait for processes to die AND for subdomain to be released on localtunnel server
+        // Localtunnel server may keep subdomain reserved for a few seconds after process dies
         return new Promise((resolve) => {
+            // First wait for local processes to die
             setTimeout(() => {
                 // Verify port is free
                 let retries = 0;
                 const checkPort = setInterval(() => {
                     try {
                         const portPids = execSync(`lsof -ti:${port}`, { encoding: 'utf8' }).trim();
-                        if (!portPids || retries >= 5) {
+                        if (!portPids || retries >= 10) {
                             clearInterval(checkPort);
-                            console.log('✅ Cleanup complete');
-                            resolve();
+                            // Additional wait for localtunnel server to release subdomain
+                            // This is important: the server-side reservation may take 5-10 seconds to clear
+                            console.log('   Waiting for subdomain to be released on localtunnel server...');
+                            setTimeout(() => {
+                                console.log('✅ Cleanup complete (subdomain should be free now)');
+                                resolve();
+                            }, 8000); // Wait 8 seconds for server-side cleanup
                         }
                         retries++;
                     } catch (e) {
                         // Port is free
                         clearInterval(checkPort);
-                        console.log('✅ Cleanup complete');
-                        resolve();
+                        console.log('   Waiting for subdomain to be released on localtunnel server...');
+                        setTimeout(() => {
+                            console.log('✅ Cleanup complete (subdomain should be free now)');
+                            resolve();
+                        }, 8000); // Wait 8 seconds for server-side cleanup
                     }
                 }, 500);
-            }, 2000);
+            }, processesToKill.length > 0 ? 3000 : 1000); // Longer wait if we killed processes
         });
     } catch (error) {
         console.error(`⚠️  Cleanup error (non-fatal): ${error.message}`);
@@ -323,6 +333,7 @@ function startTunnelInternal(deviceId, port, retryCount, maxRetries) {
     let hasError = false;
     let errorMessage = '';
     let urlVerified = false;
+    let isShuttingDown = false; // Track if we're shutting down gracefully
     
     // Parse tunnel URL from output
     let outputBuffer = '';
@@ -424,6 +435,12 @@ function startTunnelInternal(deviceId, port, retryCount, maxRetries) {
     lt.on('close', (code) => {
         clearTimeout(startupTimeout);
         
+        // Don't retry if we're shutting down gracefully
+        if (isShuttingDown) {
+            releaseLock();
+            return;
+        }
+        
         if (code !== 0 || hasError || !urlVerified) {
             console.error(`❌ Localtunnel exited with code ${code}`);
             if (errorMessage) {
@@ -435,9 +452,10 @@ function startTunnelInternal(deviceId, port, retryCount, maxRetries) {
             
             // Retry if we haven't exceeded max retries
             if (retryCount < maxRetries) {
-                // Exponential backoff: 2s, 5s, 10s
-                const backoffDelay = Math.min(1000 * Math.pow(2, retryCount) + Math.random() * 1000, 10000);
-                console.log(`\n🔄 Retrying in ${Math.round(backoffDelay/1000)} seconds...`);
+                // Exponential backoff: 5s, 10s, 15s (longer to allow subdomain to be released)
+                const baseDelay = 5000; // Start with 5 seconds
+                const backoffDelay = baseDelay * (retryCount + 1) + Math.random() * 2000;
+                console.log(`\n🔄 Retrying in ${Math.round(backoffDelay/1000)} seconds (allowing time for subdomain release)...`);
                 setTimeout(async () => {
                     await cleanupStaleProcesses(deviceId, port);
                     // Retry - lock is already held, don't acquire again
@@ -463,8 +481,8 @@ function startTunnelInternal(deviceId, port, retryCount, maxRetries) {
     // Handle graceful shutdown
     const shutdown = (signal) => {
         console.log(`\n🛑 Received ${signal}, shutting down tunnel...`);
+        isShuttingDown = true; // Mark that we're shutting down
         clearTimeout(startupTimeout);
-        releaseLock();
         
         if (lt && !lt.killed) {
             try {
@@ -483,15 +501,18 @@ function startTunnelInternal(deviceId, port, retryCount, maxRetries) {
                         lt.kill('SIGKILL');
                     }
                 }
+                releaseLock();
                 process.exit(0);
             }, 5000);
             
             // If process exits before timeout, clear timeout
-            lt.on('close', () => {
+            lt.once('close', () => {
                 clearTimeout(shutdownTimeout);
+                releaseLock();
                 process.exit(0);
             });
         } else {
+            releaseLock();
             process.exit(0);
         }
     };
