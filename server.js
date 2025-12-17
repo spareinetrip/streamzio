@@ -66,10 +66,10 @@ let cloudflareChallengeDetected = false;  // Track if Cloudflare challenge was d
 let isBrowserHeadless = false;  // Track if current browser is in headless mode
 let activePages = new Set();  // Track active pages for cleanup
 let isShuttingDown = false;  // Track if we're shutting down
-let requestQueue = [];  // Queue for browser requests to prevent overload
 let maxConcurrentRequests = 2;  // Maximum concurrent browser operations
 let activeRequestCount = 0;  // Current active browser operations
 const MAX_PAGES_PER_BROWSER = 10;  // Maximum pages to prevent memory issues
+let periodicCleanupInterval = null;  // Store interval ID for cleanup
 
 // Find Chrome/Chromium executable (works on macOS, Linux, Raspberry Pi)
 function findBrowserExecutable() {
@@ -296,7 +296,8 @@ async function getBrowser() {
             // Track headless state
             isBrowserHeadless = finalHeadless;
             
-            // Handle browser disconnection
+            // Handle browser disconnection (remove existing listeners first to prevent duplicates)
+            globalBrowser.removeAllListeners('disconnected');
             globalBrowser.on('disconnected', () => {
                 console.log(`⚠️  Browser disconnected, cleaning up and will reinitialize on next request`);
                 // Close all active pages
@@ -325,9 +326,13 @@ async function getBrowser() {
     return await browserInitPromise;
 }
 
-// Periodic cleanup of orphaned pages (every 5 minutes)
+// Periodic cleanup of orphaned pages (every 2 minutes - more aggressive)
 function startPeriodicCleanup() {
-    setInterval(async () => {
+    // Clear existing interval if any
+    if (periodicCleanupInterval) {
+        clearInterval(periodicCleanupInterval);
+    }
+    periodicCleanupInterval = setInterval(async () => {
         if (!globalBrowser || !globalBrowser.isConnected()) {
             activePages.clear();
             return;
@@ -335,27 +340,70 @@ function startPeriodicCleanup() {
         
         try {
             const browserPages = await globalBrowser.pages();
-            const browserPageIds = new Set(browserPages.map(p => p.url()));
+            const browserPageSet = new Set(browserPages);
+            
+            // Track pages that should be closed
+            const pagesToClose = [];
             
             // Remove pages from activePages that are no longer in browser
             for (const page of Array.from(activePages)) {
                 try {
-                    if (page.isClosed() || !browserPageIds.has(page.url())) {
+                    if (page.isClosed()) {
                         activePages.delete(page);
+                    } else if (!browserPageSet.has(page)) {
+                        // Page was removed from browser but still in our tracking
+                        activePages.delete(page);
+                    } else {
+                        // Page is still in browser - check if it should be closed
+                        // Keep only the first page (default blank page), close others
+                        const pageIndex = browserPages.indexOf(page);
+                        if (pageIndex > 0) {
+                            // Not the default page, mark for closing
+                            pagesToClose.push(page);
+                        }
                     }
                 } catch (e) {
+                    // Page is invalid, remove from tracking
                     activePages.delete(page);
                 }
             }
             
-            // Log if we found orphaned pages
-            if (activePages.size !== browserPages.length) {
-                console.log(`🧹 Cleaned up ${browserPages.length - activePages.size} orphaned pages`);
+            // Close pages that shouldn't be open (keep only default blank page)
+            for (const page of pagesToClose) {
+                try {
+                    activePages.delete(page);
+                    if (!page.isClosed()) {
+                        await page.close().catch(() => {});
+                    }
+                } catch (e) {
+                    // Ignore errors
+                }
+            }
+            
+            // Also check for pages in browser that aren't in our tracking
+            // These are orphaned pages that should be closed
+            for (const page of browserPages) {
+                if (!activePages.has(page) && browserPages.indexOf(page) > 0) {
+                    // Not the default page and not in our tracking - close it
+                    try {
+                        if (!page.isClosed()) {
+                            await page.close().catch(() => {});
+                        }
+                    } catch (e) {
+                        // Ignore errors
+                    }
+                }
+            }
+            
+            // Log page counts for monitoring
+            const finalBrowserPages = await globalBrowser.pages();
+            if (finalBrowserPages.length > 1 || activePages.size > 0) {
+                console.log(`🧹 Cleanup: ${finalBrowserPages.length} browser pages, ${activePages.size} tracked pages`);
             }
         } catch (error) {
             console.log(`⚠️  Error during periodic cleanup: ${error.message}`);
         }
-    }, 5 * 60 * 1000); // Every 5 minutes
+    }, 2 * 60 * 1000); // Every 2 minutes (more aggressive)
 }
 
 // Pre-start browser on server startup for faster first request
@@ -385,6 +433,29 @@ function releaseBrowserSlot() {
     activeRequestCount = Math.max(0, activeRequestCount - 1);
 }
 
+// Helper function to cleanup browser pages after request completion or error
+async function cleanupBrowserPages() {
+    try {
+        if (globalBrowser && globalBrowser.isConnected()) {
+            const browserPages = await globalBrowser.pages();
+            // Keep only the default blank page, close others
+            for (let i = browserPages.length - 1; i > 0; i--) {
+                const page = browserPages[i];
+                if (!page.isClosed() && !activePages.has(page)) {
+                    try {
+                        await page.close().catch(() => {});
+                    } catch (e) {
+                        // Ignore errors
+                    }
+                }
+            }
+        }
+    } catch (cleanupError) {
+        // Don't fail if cleanup fails
+        console.log(`⚠️  Cleanup warning: ${cleanupError.message}`);
+    }
+}
+
 // Fetch MultiUp page using Puppeteer (handles Cloudflare automatically)
 async function fetchMultiUpPage(url) {
     let browser = null;
@@ -405,7 +476,24 @@ async function fetchMultiUpPage(url) {
         // Check page limit before creating new page
         const currentPages = await browser.pages();
         if (currentPages.length >= MAX_PAGES_PER_BROWSER) {
-            throw new Error(`Too many pages (${currentPages.length}), cannot create new page`);
+            console.log(`⚠️  Too many pages (${currentPages.length}), cleaning up before creating new page...`);
+            // Close all pages except the default blank page
+            for (let i = currentPages.length - 1; i > 0; i--) {
+                const p = currentPages[i];
+                try {
+                    activePages.delete(p);
+                    if (!p.isClosed()) {
+                        await p.close().catch(() => {});
+                    }
+                } catch (e) {
+                    // Ignore errors
+                }
+            }
+            // Re-check after cleanup
+            const pagesAfterCleanup = await browser.pages();
+            if (pagesAfterCleanup.length >= MAX_PAGES_PER_BROWSER) {
+                throw new Error(`Too many pages (${pagesAfterCleanup.length}) after cleanup, cannot create new page`);
+            }
         }
         
         page = await browser.newPage();
@@ -468,9 +556,12 @@ async function fetchMultiUpPage(url) {
                     activePages.delete(page);
                     try {
                         if (!page.isClosed()) {
-                            await page.close();
+                            await page.close().catch(() => {});
                         }
-                    } catch (e) {}
+                    } catch (e) {
+                        // Ensure it's removed from tracking even if close fails
+                        activePages.delete(page);
+                    }
                 }
                 
                 // Close current browser and clean up all pages
@@ -482,12 +573,22 @@ async function fetchMultiUpPage(url) {
                             activePages.delete(p);
                             try {
                                 if (!p.isClosed()) {
-                                    await p.close();
+                                    await p.close().catch(() => {});
                                 }
-                            } catch (e) {}
+                            } catch (e) {
+                                // Ensure it's removed from tracking
+                                activePages.delete(p);
+                            }
                         }
-                    } catch (e) {}
-                    await browser.close();
+                    } catch (e) {
+                        // Clear tracking if we can't get pages
+                        activePages.clear();
+                    }
+                    try {
+                        await browser.close();
+                    } catch (e) {
+                        // Browser might already be closed
+                    }
                 }
                 
                 globalBrowser = null;
@@ -593,7 +694,7 @@ async function fetchMultiUpPage(url) {
         console.error(`❌ Error fetching MultiUp page: ${error.message}`);
         throw error;
     } finally {
-        // Always cleanup page
+        // Always cleanup page - ensure it's closed and removed from tracking
         if (page) {
             try {
                 activePages.delete(page);
@@ -601,9 +702,11 @@ async function fetchMultiUpPage(url) {
                     await page.close().catch(() => {});
                 }
             } catch (e) {
-                // Ignore cleanup errors
+                // Ignore cleanup errors, but ensure it's removed from tracking
+                activePages.delete(page);
             }
         }
+        // Always release browser slot, even if cleanup failed
         releaseBrowserSlot();
     }
 }
@@ -1029,13 +1132,21 @@ async function getRealDebridStream(link, apiKey) {
 
 // Helper function to wrap async operations with timeout
 function withTimeout(promise, timeoutMs, operationName) {
+    let timeoutId = null;
+    const timeoutPromise = new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+            reject(new Error(`${operationName} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+    });
+    
     return Promise.race([
-        promise,
-        new Promise((_, reject) => {
-            setTimeout(() => {
-                reject(new Error(`${operationName} timed out after ${timeoutMs}ms`));
-            }, timeoutMs);
-        })
+        promise.finally(() => {
+            // Clear timeout if promise resolves/rejects before timeout
+            if (timeoutId) {
+                clearTimeout(timeoutId);
+            }
+        }),
+        timeoutPromise
     ]);
 }
 
@@ -1132,6 +1243,8 @@ async function handleStreamRequest(type, id, requestStartTime, config) {
             console.log(`⏱️  Search took ${searchTime}ms`);
             if (!postUrl) {
                 console.log(`✅ Returning empty streams (no post found)`);
+                // Cleanup browser pages before returning
+                await cleanupBrowserPages();
                 return { streams: [] };
             }
             
@@ -1142,6 +1255,8 @@ async function handleStreamRequest(type, id, requestStartTime, config) {
             console.log(`⏱️  MultiUp extraction took ${extractTime}ms`);
             if (!multiUpLink) {
                 console.log(`✅ Returning empty streams (no MultiUp link found)`);
+                // Cleanup browser pages before returning
+                await cleanupBrowserPages();
                 return { streams: [] };
             }
             
@@ -1163,6 +1278,8 @@ async function handleStreamRequest(type, id, requestStartTime, config) {
             console.log(`⏱️  Hoster extraction took ${hosterTime}ms`);
             if (hosterLinks.length === 0) {
                 console.log(`✅ Returning empty streams (no hoster links found)`);
+                // Cleanup browser pages before returning
+                await cleanupBrowserPages();
                 return { streams: [] };
             }
             
@@ -1177,7 +1294,8 @@ async function handleStreamRequest(type, id, requestStartTime, config) {
             const sizeDisplay = formatFileSize(metadata.size, metadata.sizeUnit);
             const scenegroupDisplay = metadata.scenegroup || 'Unknown';
             
-            // Get Real-Debrid streams - try all hoster links
+            // Get Real-Debrid streams - try hoster links until we find one that works
+            // Stop after first successful stream (we don't need multiple streams for the same video)
             const rdStartTime = Date.now();
             const streams = [];
             for (const hosterLink of hosterLinks) {
@@ -1211,12 +1329,26 @@ async function handleStreamRequest(type, id, requestStartTime, config) {
                             }
                         });
                         console.log(`✅ Added stream from ${hosterLink.host}`);
+                        // Stop after first successful stream - we don't need multiple streams
+                        break;
                     }
                 } catch (error) {
-                    console.log(`⚠️  Failed to get stream from ${hosterLink.host}: ${error.message}`);
+                    const errorData = error.response?.data || {};
+                    const errorCode = errorData.error_code;
+                    const errorMsg = errorData.error || error.message;
+                    
+                    // Log Real-Debrid errors (including unsupported hosters)
+                    if (errorCode === 16 || errorMsg === 'hoster_unsupported') {
+                        console.log(`❌ Real-Debrid error: { error: 'hoster_unsupported', error_code: ${errorCode} }`);
+                    } else {
+                        console.log(`⚠️  Failed to get stream from ${hosterLink.host}: ${errorMsg}`);
+                    }
                     // Continue to next hoster
                 }
             }
+            
+            // Cleanup browser pages after Real-Debrid processing (whether successful or not)
+            await cleanupBrowserPages();
             
             // Cache the streams if we have an IMDB ID and got results
             if (imdbId.startsWith('tt') && streams.length > 0) {
@@ -1229,6 +1361,7 @@ async function handleStreamRequest(type, id, requestStartTime, config) {
             console.log(`⏱️  Total request time: ${totalTime}ms`);
             console.log(`✅ Returning ${streams.length} stream(s)`);
             
+            // Cleanup already done after Real-Debrid processing
             return { streams };
         } else if (type === 'movie' && parts.length >= 2) {
             const title = parts.slice(1).join(':');
@@ -1245,6 +1378,12 @@ async function handleStreamRequest(type, id, requestStartTime, config) {
     } catch (error) {
         console.error('❌ Error in stream handler:', error);
         console.error('Stack:', error.stack);
+        // Ensure cleanup happens even on error
+        try {
+            await cleanupBrowserPages();
+        } catch (cleanupError) {
+            console.log(`⚠️  Cleanup error in catch block: ${cleanupError.message}`);
+        }
         return { streams: [] };
     }
 }
@@ -1284,6 +1423,12 @@ async function gracefulShutdown() {
     browserInitializing = false;
     browserInitPromise = null;
     
+    // Clear periodic cleanup interval
+    if (periodicCleanupInterval) {
+        clearInterval(periodicCleanupInterval);
+        periodicCleanupInterval = null;
+    }
+    
     console.log('✅ Graceful shutdown complete');
 }
 
@@ -1301,6 +1446,14 @@ process.on('SIGINT', async () => {
 // Handle uncaught errors
 process.on('unhandledRejection', (reason, promise) => {
     console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+    // Log stack trace if available
+    if (reason && reason.stack) {
+        console.error('Stack:', reason.stack);
+    }
+    // Don't exit - log and continue, but ensure cleanup
+    cleanupBrowserPages().catch(err => {
+        console.error('⚠️  Cleanup failed in unhandled rejection:', err.message);
+    });
 });
 
 process.on('uncaughtException', (error) => {
