@@ -717,6 +717,7 @@ function startTunnelInternal(deviceId, port, retryCount, maxRetries) {
                 console.error(`   4. Check logs: journalctl -u streamzio -f`);
                 process.exit(1);
             }
+        }
         // Note: The else-if branch for urlVerified was removed because it's logically unreachable:
         // - First if handles: urlVerified && code === 0 && !hasError (restarts)
         // - Second if handles: code !== 0 || hasError || !urlVerified (errors/retries)
