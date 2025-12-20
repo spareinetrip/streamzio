@@ -7,15 +7,42 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const { getConfig } = require('./config');
 const { execSync } = require('child_process');
 const { getCachedStreams, setCachedStreams } = require('./cache');
+const path = require('path');
+const fs = require('fs');
 
 // Use stealth plugin to bypass Cloudflare detection
 puppeteer.use(StealthPlugin());
 
 const REALDEBRID_API_URL = 'https://api.real-debrid.com/rest/1.0';
 const CINEMETA_API_URL = 'https://v3-cinemeta.strem.io';
+const MAX_PAGES_PER_BROWSER = 10;
+const MAX_CONCURRENT_REQUESTS = 2;
+const REQUEST_TIMEOUT_MS = 120000;
+const BROWSER_TIMEOUT_MS = 60000;
+const CLOUDFLARE_WAIT_TIMEOUT_MS = 45000;
 
 // Dynamic base URL - updated from requests
 let dynamicBaseUrl = null;
+
+// Browser management state
+let globalBrowser = null;
+let browserInitializing = false;
+let browserInitPromise = null;
+let cloudflareChallengeDetected = false;
+let isBrowserHeadless = false;
+let activePages = new Set();
+let isShuttingDown = false;
+let activeRequestCount = 0;
+let periodicCleanupInterval = null;
+
+// Logging helper functions
+const logger = {
+    info: (msg) => console.log(`[INFO] ${msg}`),
+    warn: (msg) => console.log(`[WARN] ${msg}`),
+    error: (msg) => console.error(`[ERROR] ${msg}`),
+    debug: (msg) => console.log(`[DEBUG] ${msg}`),
+    timing: (operation, duration) => console.log(`[TIMING] ${operation}: ${duration}ms`)
+};
 
 // Helper to check if host is localhost
 function isLocalhost(host) {
@@ -26,15 +53,12 @@ function isLocalhost(host) {
 
 function getPublicBaseUrl() {
     const config = getConfig();
-    // Use configured base URL if set
     if (config.server.publicBaseUrl) {
         return config.server.publicBaseUrl;
     }
-    // Use dynamically detected base URL from requests
     if (dynamicBaseUrl) {
         return dynamicBaseUrl;
     }
-    // Fallback to localhost (HTTP for localhost)
     const httpPort = config.server.port || 7004;
     return `http://localhost:${httpPort}`;
 }
@@ -45,47 +69,27 @@ const manifest = {
     version: '1.0.0',
     name: 'Streamzio',
     description: 'Flemish content from scnlog.me with Real-Debrid integration',
-    logo: 'http://localhost:7004/logo.jpg', // Will be updated dynamically
+    logo: 'http://localhost:7004/logo.jpg',
     background: '',
     types: ['series', 'movie'],
     catalogs: [],
     resources: ['stream'],
-    idPrefixes: ['tt'] // Enable for Cinemeta (IMDB) content
+    idPrefixes: ['tt']
 };
 
 const builder = new addonBuilder(manifest);
 
-const path = require('path');
-const fs = require('fs');
-
-// Global browser instance (reused across requests for speed)
-let globalBrowser = null;
-let browserInitializing = false;
-let browserInitPromise = null;
-let cloudflareChallengeDetected = false;  // Track if Cloudflare challenge was detected
-let isBrowserHeadless = false;  // Track if current browser is in headless mode
-let activePages = new Set();  // Track active pages for cleanup
-let isShuttingDown = false;  // Track if we're shutting down
-let maxConcurrentRequests = 2;  // Maximum concurrent browser operations
-let activeRequestCount = 0;  // Current active browser operations
-const MAX_PAGES_PER_BROWSER = 10;  // Maximum pages to prevent memory issues
-let periodicCleanupInterval = null;  // Store interval ID for cleanup
-
-// Find Chrome/Chromium executable (works on macOS, Linux, Raspberry Pi)
+// Find Chrome/Chromium executable
 function findBrowserExecutable() {
     const possiblePaths = [
-        // macOS
         '/Applications/Chromium.app/Contents/MacOS/Chromium',
         '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-        // Linux / Raspberry Pi
         '/usr/bin/chromium',
         '/usr/bin/chromium-browser',
         '/usr/bin/google-chrome',
         '/snap/bin/chromium',
-        // Environment variables
         process.env.CHROME_PATH,
         process.env.CHROMIUM_PATH,
-        // Common fallbacks
         'chromium',
         'chromium-browser',
         'google-chrome'
@@ -100,73 +104,58 @@ function findBrowserExecutable() {
     return null;
 }
 
-// Check if X11 display is available (even if DISPLAY env var is not set)
+// Check if X11 display is available
 function detectDisplay() {
-    // First check if DISPLAY env var is set
     if (process.env.DISPLAY && process.env.DISPLAY !== '') {
         return process.env.DISPLAY;
     }
     
-    // Check if running on Wayland (XWayland provides X11 compatibility)
     const waylandDisplay = process.env.WAYLAND_DISPLAY;
     const xdgSessionType = process.env.XDG_SESSION_TYPE;
     
     if (waylandDisplay || xdgSessionType === 'wayland') {
-        console.log(`   🔍 Detected Wayland session - checking for XWayland...`);
-        // On Wayland, XWayland typically uses DISPLAY=:0 or :1
-        // Check for XWayland sockets (doesn't require xdpyinfo)
+        logger.debug('Detected Wayland session - checking for XWayland');
         for (let i = 0; i <= 2; i++) {
             const xwaylandSocket = `/tmp/.X11-unix/X${i}`;
             if (fs.existsSync(xwaylandSocket)) {
-                console.log(`   ✅ Found XWayland socket - using DISPLAY=:${i}`);
+                logger.debug(`Found XWayland socket - using DISPLAY=:${i}`);
                 return `:${i}`;
             }
         }
-        // Try xdpyinfo if available (optional check)
         for (let i = 0; i <= 2; i++) {
             try {
                 execSync(`xdpyinfo -display :${i} > /dev/null 2>&1`, { timeout: 1000 });
-                console.log(`   ✅ XWayland display :${i} is accessible`);
+                logger.debug(`XWayland display :${i} is accessible`);
                 return `:${i}`;
             } catch (e) {
                 // xdpyinfo not available or display not accessible
             }
         }
-        // If XWayland detection fails, try :0 as default for Wayland
-        // XWayland usually runs on :0 on Wayland systems
-        console.log(`   💡 Wayland detected - will try DISPLAY=:0 (XWayland default)`);
+        logger.debug('Wayland detected - will try DISPLAY=:0 (XWayland default)');
         return ':0';
     }
     
-    // Try to detect X11 display by checking common locations
-    // On Raspberry Pi with desktop environment, X11 usually runs on :0
     try {
-        // Check if X11 is running by checking for X server socket
-        // Common locations: /tmp/.X11-unix/X0, /tmp/.X0-lock
         const x11Socket = '/tmp/.X11-unix/X0';
         const x11Lock = '/tmp/.X0-lock';
         
         if (fs.existsSync(x11Socket) || fs.existsSync(x11Lock)) {
-            console.log(`   ✅ Detected X11 display socket - using DISPLAY=:0`);
+            logger.debug('Detected X11 display socket - using DISPLAY=:0');
             return ':0';
         }
         
-        // Alternative: try to run xdpyinfo to check if X11 is accessible
-        // This is more reliable but requires xdpyinfo to be installed
         try {
             execSync('xdpyinfo -display :0 > /dev/null 2>&1', { timeout: 1000 });
-            console.log(`   ✅ X11 display :0 is accessible`);
+            logger.debug('X11 display :0 is accessible');
             return ':0';
         } catch (e) {
             // xdpyinfo not available or X11 not accessible
         }
         
-        // Check for VNC displays (common on Raspberry Pi)
-        // VNC typically uses :1, :2, etc.
         for (let i = 1; i <= 10; i++) {
             try {
                 execSync(`xdpyinfo -display :${i} > /dev/null 2>&1`, { timeout: 500 });
-                console.log(`   ✅ Detected X11 display :${i} (likely VNC)`);
+                logger.debug(`Detected X11 display :${i} (likely VNC)`);
                 return `:${i}`;
             } catch (e) {
                 // Not this display
@@ -179,16 +168,13 @@ function detectDisplay() {
     return null;
 }
 
-// Initialize browser instance (reused for speed)
+// Initialize browser instance
 async function getBrowser() {
-    // Return existing browser if available and healthy
     if (globalBrowser && globalBrowser.isConnected()) {
         try {
-            // Verify browser is actually working by checking pages
             const pages = await globalBrowser.pages();
-            // If we have too many pages, something is wrong - reset browser
             if (pages.length > MAX_PAGES_PER_BROWSER) {
-                console.log(`⚠️  Too many pages (${pages.length}), resetting browser...`);
+                logger.warn(`Too many pages (${pages.length}), resetting browser`);
                 try {
                     await globalBrowser.close();
                 } catch (e) {}
@@ -198,90 +184,75 @@ async function getBrowser() {
                 return globalBrowser;
             }
         } catch (error) {
-            console.log(`⚠️  Browser connection check failed: ${error.message}, reinitializing...`);
+            logger.warn(`Browser connection check failed: ${error.message}, reinitializing`);
             globalBrowser = null;
             activePages.clear();
         }
     }
     
-    // If already initializing, wait for that promise
     if (browserInitializing && browserInitPromise) {
         return await browserInitPromise;
     }
     
-    // Start initialization
     browserInitializing = true;
     browserInitPromise = (async () => {
         try {
-            console.log(`🌐 Initializing browser instance (will be reused for all requests)...`);
+            logger.info('Initializing browser instance');
             
             const executablePath = findBrowserExecutable();
             if (executablePath) {
-                console.log(`✅ Found browser at: ${executablePath}`);
+                logger.debug(`Found browser at: ${executablePath}`);
             } else {
-                console.log(`⚠️  Browser not found in common paths, trying default...`);
+                logger.warn('Browser not found in common paths, trying default');
             }
             
-            // Create user data directory for persistent cookies/session
             const userDataDir = path.join(__dirname, '.browser-data');
             if (!fs.existsSync(userDataDir)) {
                 fs.mkdirSync(userDataDir, { recursive: true });
             }
             
-            // Check if we have cookies (indicates Cloudflare was solved before)
             const cookieDbPath = path.join(userDataDir, 'Default', 'Cookies');
             const hasCookies = fs.existsSync(cookieDbPath);
             
-            // Detect display (checks DISPLAY env var and X11 availability)
             const detectedDisplay = detectDisplay();
             const hasDisplay = detectedDisplay !== null;
             
-            // Set DISPLAY environment variable if detected but not set
             if (detectedDisplay && !process.env.DISPLAY) {
                 process.env.DISPLAY = detectedDisplay;
-                console.log(`   🔧 Set DISPLAY=${detectedDisplay} for browser`);
+                logger.debug(`Set DISPLAY=${detectedDisplay} for browser`);
             }
             
-            // Use headless mode if:
-            // 1. No display available (headless server), OR
-            // 2. Cookies exist AND no challenge was detected recently
-            // Otherwise use visible browser for Cloudflare challenge (only if display is available)
             const useHeadless = !hasDisplay || (hasCookies && !cloudflareChallengeDetected);
             
             if (!hasDisplay) {
-                console.log(`   No DISPLAY detected - using headless mode (required for headless servers)`);
-                console.log(`   💡 Tip: If you have a display available, set DISPLAY in systemd service file`);
+                logger.info('No DISPLAY detected - using headless mode');
             } else {
-                console.log(`   Mode: ${useHeadless ? 'headless' : 'visible'} (cookies exist: ${hasCookies}, challenge detected: ${cloudflareChallengeDetected})`);
-                console.log(`   Display: ${process.env.DISPLAY || detectedDisplay}`);
+                logger.info(`Browser mode: ${useHeadless ? 'headless' : 'visible'} (cookies: ${hasCookies}, challenge: ${cloudflareChallengeDetected})`);
+                logger.debug(`Display: ${process.env.DISPLAY || detectedDisplay}`);
             }
             
-            // Browser args optimized for speed and Raspberry Pi compatibility
             const browserArgs = [
-                '--no-sandbox',  // Required for Raspberry Pi
-                '--disable-setuid-sandbox',  // Required for Raspberry Pi
-                '--disable-dev-shm-usage',  // Prevents crashes on low-memory systems
-                '--disable-blink-features=AutomationControlled',  // Hide automation
-                '--disable-gpu',  // Faster, especially on Raspberry Pi
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-gpu',
                 '--disable-software-rasterizer',
-                '--disable-extensions',  // Faster startup
-                '--disable-background-networking',  // Faster
-                '--disable-background-timer-throttling',  // Faster
-                '--disable-renderer-backgrounding',  // Faster
-                '--disable-backgrounding-occluded-windows',  // Faster
-                '--disable-ipc-flooding-protection',  // Faster
-                '--memory-pressure-off',  // Better for Raspberry Pi
-                '--max_old_space_size=4096'  // Limit memory usage
+                '--disable-extensions',
+                '--disable-background-networking',
+                '--disable-background-timer-throttling',
+                '--disable-renderer-backgrounding',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-ipc-flooding-protection',
+                '--memory-pressure-off',
+                '--max_old_space_size=4096'
             ];
             
-            // Add headless-specific args if no display is available
             if (!hasDisplay) {
-                browserArgs.push('--headless=new');  // New headless mode
-                browserArgs.push('--virtual-time-budget=5000');  // Helps with Cloudflare bypass
+                browserArgs.push('--headless=new');
+                browserArgs.push('--virtual-time-budget=5000');
             }
             
-            // Launch browser with persistent user data directory
-            // Force headless if no display is available
             const finalHeadless = !hasDisplay ? true : useHeadless;
             
             globalBrowser = await puppeteer.launch({
@@ -291,16 +262,13 @@ async function getBrowser() {
                 args: browserArgs
             });
             
-            console.log(`✅ Browser initialized and ready (${finalHeadless ? 'headless' : 'visible'} mode)`);
+            logger.info(`Browser initialized (${finalHeadless ? 'headless' : 'visible'} mode)`);
             
-            // Track headless state
             isBrowserHeadless = finalHeadless;
             
-            // Handle browser disconnection (remove existing listeners first to prevent duplicates)
             globalBrowser.removeAllListeners('disconnected');
             globalBrowser.on('disconnected', () => {
-                console.log(`⚠️  Browser disconnected, cleaning up and will reinitialize on next request`);
-                // Close all active pages
+                logger.warn('Browser disconnected, will reinitialize on next request');
                 activePages.forEach(page => {
                     try {
                         page.close().catch(() => {});
@@ -318,7 +286,7 @@ async function getBrowser() {
         } catch (error) {
             browserInitializing = false;
             browserInitPromise = null;
-            console.error(`❌ Failed to initialize browser: ${error.message}`);
+            logger.error(`Failed to initialize browser: ${error.message}`);
             throw error;
         }
     })();
@@ -326,9 +294,8 @@ async function getBrowser() {
     return await browserInitPromise;
 }
 
-// Periodic cleanup of orphaned pages (every 2 minutes - more aggressive)
+// Periodic cleanup of orphaned pages
 function startPeriodicCleanup() {
-    // Clear existing interval if any
     if (periodicCleanupInterval) {
         clearInterval(periodicCleanupInterval);
     }
@@ -342,33 +309,25 @@ function startPeriodicCleanup() {
             const browserPages = await globalBrowser.pages();
             const browserPageSet = new Set(browserPages);
             
-            // Track pages that should be closed
             const pagesToClose = [];
             
-            // Remove pages from activePages that are no longer in browser
             for (const page of Array.from(activePages)) {
                 try {
                     if (page.isClosed()) {
                         activePages.delete(page);
                     } else if (!browserPageSet.has(page)) {
-                        // Page was removed from browser but still in our tracking
                         activePages.delete(page);
                     } else {
-                        // Page is still in browser - check if it should be closed
-                        // Keep only the first page (default blank page), close others
                         const pageIndex = browserPages.indexOf(page);
                         if (pageIndex > 0) {
-                            // Not the default page, mark for closing
                             pagesToClose.push(page);
                         }
                     }
                 } catch (e) {
-                    // Page is invalid, remove from tracking
                     activePages.delete(page);
                 }
             }
             
-            // Close pages that shouldn't be open (keep only default blank page)
             for (const page of pagesToClose) {
                 try {
                     activePages.delete(page);
@@ -380,11 +339,8 @@ function startPeriodicCleanup() {
                 }
             }
             
-            // Also check for pages in browser that aren't in our tracking
-            // These are orphaned pages that should be closed
             for (const page of browserPages) {
                 if (!activePages.has(page) && browserPages.indexOf(page) > 0) {
-                    // Not the default page and not in our tracking - close it
                     try {
                         if (!page.isClosed()) {
                             await page.close().catch(() => {});
@@ -395,34 +351,31 @@ function startPeriodicCleanup() {
                 }
             }
             
-            // Log page counts for monitoring
             const finalBrowserPages = await globalBrowser.pages();
             if (finalBrowserPages.length > 1 || activePages.size > 0) {
-                console.log(`🧹 Cleanup: ${finalBrowserPages.length} browser pages, ${activePages.size} tracked pages`);
+                logger.debug(`Cleanup: ${finalBrowserPages.length} browser pages, ${activePages.size} tracked pages`);
             }
         } catch (error) {
-            console.log(`⚠️  Error during periodic cleanup: ${error.message}`);
+            logger.warn(`Error during periodic cleanup: ${error.message}`);
         }
-    }, 2 * 60 * 1000); // Every 2 minutes (more aggressive)
+    }, 2 * 60 * 1000);
 }
 
-// Pre-start browser on server startup for faster first request
+// Pre-start browser on server startup
 async function preStartBrowser() {
     try {
-        console.log(`🚀 Pre-starting browser for faster first request...`);
+        logger.info('Pre-starting browser for faster first request');
         await getBrowser();
-        console.log(`✅ Browser pre-started successfully`);
-        
-        // Start periodic cleanup
+        logger.info('Browser pre-started successfully');
         startPeriodicCleanup();
     } catch (error) {
-        console.log(`⚠️  Browser pre-start failed (will start on first request): ${error.message}`);
+        logger.warn(`Browser pre-start failed: ${error.message}`);
     }
 }
 
 // Helper function to wait for available slot in request queue
 async function waitForBrowserSlot() {
-    while (activeRequestCount >= maxConcurrentRequests) {
+    while (activeRequestCount >= MAX_CONCURRENT_REQUESTS) {
         await new Promise(resolve => setTimeout(resolve, 100));
     }
     activeRequestCount++;
@@ -433,12 +386,11 @@ function releaseBrowserSlot() {
     activeRequestCount = Math.max(0, activeRequestCount - 1);
 }
 
-// Helper function to cleanup browser pages after request completion or error
+// Helper function to cleanup browser pages
 async function cleanupBrowserPages() {
     try {
         if (globalBrowser && globalBrowser.isConnected()) {
             const browserPages = await globalBrowser.pages();
-            // Keep only the default blank page, close others
             for (let i = browserPages.length - 1; i > 0; i--) {
                 const page = browserPages[i];
                 if (!page.isClosed() && !activePages.has(page)) {
@@ -451,33 +403,28 @@ async function cleanupBrowserPages() {
             }
         }
     } catch (cleanupError) {
-        // Don't fail if cleanup fails
-        console.log(`⚠️  Cleanup warning: ${cleanupError.message}`);
+        logger.warn(`Cleanup warning: ${cleanupError.message}`);
     }
 }
 
-// Fetch MultiUp page using Puppeteer (handles Cloudflare automatically)
+// Fetch MultiUp page using Puppeteer
 async function fetchMultiUpPage(url) {
     let browser = null;
     let page = null;
     let needsVisibleBrowser = false;
     
-    // Wait for available slot
     await waitForBrowserSlot();
     
     try {
         browser = await getBrowser();
         
-        // Check if browser is still connected
         if (!browser.isConnected()) {
             throw new Error('Browser disconnected');
         }
         
-        // Check page limit before creating new page
         const currentPages = await browser.pages();
         if (currentPages.length >= MAX_PAGES_PER_BROWSER) {
-            console.log(`⚠️  Too many pages (${currentPages.length}), cleaning up before creating new page...`);
-            // Close all pages except the default blank page
+            logger.warn(`Too many pages (${currentPages.length}), cleaning up`);
             for (let i = currentPages.length - 1; i > 0; i--) {
                 const p = currentPages[i];
                 try {
@@ -489,69 +436,59 @@ async function fetchMultiUpPage(url) {
                     // Ignore errors
                 }
             }
-            // Re-check after cleanup
             const pagesAfterCleanup = await browser.pages();
             if (pagesAfterCleanup.length >= MAX_PAGES_PER_BROWSER) {
-                throw new Error(`Too many pages (${pagesAfterCleanup.length}) after cleanup, cannot create new page`);
+                throw new Error(`Too many pages (${pagesAfterCleanup.length}) after cleanup`);
             }
         }
         
         page = await browser.newPage();
         activePages.add(page);
         
-        // Set page timeout to prevent hanging
-        page.setDefaultTimeout(60000);
+        page.setDefaultTimeout(BROWSER_TIMEOUT_MS);
         
-        // Handle page errors
         page.on('error', (error) => {
-            console.log(`⚠️  Page error: ${error.message}`);
+            logger.warn(`Page error: ${error.message}`);
         });
         
         page.on('pageerror', (error) => {
-            console.log(`⚠️  Page JS error: ${error.message}`);
+            logger.warn(`Page JS error: ${error.message}`);
         });
-        console.log(`📄 Fetching page with Puppeteer: ${url}`);
         
-        // Set realistic browser properties (optimized)
+        logger.debug(`Fetching page with Puppeteer: ${url}`);
+        
         await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
         await page.setViewport({ width: 1920, height: 1080 });
         
-        // Remove webdriver property
         await page.evaluateOnNewDocument(() => {
             Object.defineProperty(navigator, 'webdriver', {
                 get: () => undefined
             });
         });
         
-        // Navigate and wait for Cloudflare challenge to complete
         await page.goto(url, {
             waitUntil: 'networkidle2',
-            timeout: 60000
+            timeout: BROWSER_TIMEOUT_MS
         });
         
-        // Check if we got a Cloudflare challenge page
         const pageTitle = await page.title();
         const pageContent = await page.content();
         
         if (pageTitle.includes('Just a moment') || pageContent.includes('challenges.cloudflare.com')) {
-            console.log(`⚠️  Cloudflare challenge detected!`);
+            logger.warn('Cloudflare challenge detected');
             
-            // Detect display (checks DISPLAY env var and X11 availability)
             const detectedDisplay = detectDisplay();
             const hasDisplay = detectedDisplay !== null;
             
-            // Set DISPLAY if detected but not set
             if (detectedDisplay && !process.env.DISPLAY) {
                 process.env.DISPLAY = detectedDisplay;
             }
             
-            // If we're in headless mode and got a challenge, restart in visible mode (only if display is available)
             if (isBrowserHeadless && hasDisplay) {
-                console.log(`🔄 Cookies niet meer geldig! Browser opent opnieuw in visible mode voor Cloudflare challenge...`);
+                logger.info('Cookies expired - restarting browser in visible mode for Cloudflare challenge');
                 cloudflareChallengeDetected = true;
                 needsVisibleBrowser = true;
                 
-                // Clean up current page
                 if (page) {
                     activePages.delete(page);
                     try {
@@ -559,14 +496,11 @@ async function fetchMultiUpPage(url) {
                             await page.close().catch(() => {});
                         }
                     } catch (e) {
-                        // Ensure it's removed from tracking even if close fails
                         activePages.delete(page);
                     }
                 }
                 
-                // Close current browser and clean up all pages
                 if (browser && browser.isConnected()) {
-                    // Close all pages before closing browser
                     try {
                         const pages = await browser.pages();
                         for (const p of pages) {
@@ -576,12 +510,10 @@ async function fetchMultiUpPage(url) {
                                     await p.close().catch(() => {});
                                 }
                             } catch (e) {
-                                // Ensure it's removed from tracking
                                 activePages.delete(p);
                             }
                         }
                     } catch (e) {
-                        // Clear tracking if we can't get pages
                         activePages.clear();
                     }
                     try {
@@ -596,10 +528,8 @@ async function fetchMultiUpPage(url) {
                 browserInitPromise = null;
                 isBrowserHeadless = false;
                 
-                // Get new browser in visible mode
                 browser = await getBrowser();
                 
-                // Check if browser is still connected
                 if (!browser.isConnected()) {
                     throw new Error('Browser disconnected after restart');
                 }
@@ -607,16 +537,14 @@ async function fetchMultiUpPage(url) {
                 page = await browser.newPage();
                 activePages.add(page);
                 
-                // Set page timeout and error handlers again
-                page.setDefaultTimeout(60000);
+                page.setDefaultTimeout(BROWSER_TIMEOUT_MS);
                 page.on('error', (error) => {
-                    console.log(`⚠️  Page error: ${error.message}`);
+                    logger.warn(`Page error: ${error.message}`);
                 });
                 page.on('pageerror', (error) => {
-                    console.log(`⚠️  Page JS error: ${error.message}`);
+                    logger.warn(`Page JS error: ${error.message}`);
                 });
                 
-                // Set properties again
                 await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
                 await page.setViewport({ width: 1920, height: 1080 });
                 await page.evaluateOnNewDocument(() => {
@@ -625,76 +553,63 @@ async function fetchMultiUpPage(url) {
                     });
                 });
                 
-                // Navigate again
-                console.log(`📄 Opnieuw navigeren met visible browser...`);
+                logger.debug('Navigating again with visible browser');
                 await page.goto(url, {
                     waitUntil: 'networkidle2',
-                    timeout: 60000
+                    timeout: BROWSER_TIMEOUT_MS
                 });
                 
-                // Check again after navigation
                 const newPageTitle = await page.title();
                 const newPageContent = await page.content();
                 if (newPageTitle.includes('Just a moment') || newPageContent.includes('challenges.cloudflare.com')) {
-                    console.log(`⚠️  Browser venster is nu zichtbaar - voltooi de Cloudflare challenge handmatig`);
+                    logger.info('Browser window is now visible - complete the Cloudflare challenge manually');
                 }
             } else if (isBrowserHeadless && !hasDisplay) {
-                console.log(`⚠️  Cloudflare challenge detected but no display available - waiting in headless mode...`);
-                console.log(`   💡 On headless servers, Cloudflare may need manual intervention or cookies from another machine`);
+                logger.warn('Cloudflare challenge detected but no display available - waiting in headless mode');
             } else {
-                console.log(`⚠️  Browser is al in visible mode - voltooi de Cloudflare challenge handmatig`);
+                logger.info('Browser is already in visible mode - complete the Cloudflare challenge manually');
             }
         }
         
-        // Wait for Cloudflare challenge to complete
-        console.log(`⏳ Waiting for Cloudflare challenge...`);
+        logger.debug('Waiting for Cloudflare challenge');
         try {
             await Promise.race([
-                page.waitForSelector('h2', { timeout: 45000 }),
+                page.waitForSelector('h2', { timeout: CLOUDFLARE_WAIT_TIMEOUT_MS }),
                 page.waitForFunction(
                     () => !document.title.includes('Just a moment'),
-                    { timeout: 45000 }
+                    { timeout: CLOUDFLARE_WAIT_TIMEOUT_MS }
                 )
             ]);
-            console.log(`✅ Cloudflare challenge passed`);
+            logger.debug('Cloudflare challenge passed');
             
-            // Reset challenge flag after successful pass
             if (needsVisibleBrowser) {
                 cloudflareChallengeDetected = false;
-                console.log(`✅ Cookies opgeslagen - volgende requests gebruiken headless mode`);
+                logger.info('Cookies saved - next requests will use headless mode');
             }
         } catch (e) {
-            console.log(`⚠️  Still waiting for Cloudflare...`);
+            logger.debug('Still waiting for Cloudflare');
             await page.waitForTimeout(3000);
         }
         
-        // Wait for h2 element (like MultiUp-Direct)
         try {
             await page.waitForSelector('h2', { timeout: 30000 });
-            console.log(`✅ Page content loaded`);
+            logger.debug('Page content loaded');
         } catch (e) {
-            console.log(`⚠️  h2 element not found, continuing anyway...`);
+            logger.debug('h2 element not found, continuing anyway');
         }
         
-        // Get page HTML
         const pageHtml = await page.content();
-        console.log(`✅ Got HTML (length: ${pageHtml.length})`);
+        logger.debug(`Got HTML (length: ${pageHtml.length})`);
         
-        // Final check - if we still have Cloudflare challenge, user needs to complete it manually
         if (pageHtml.includes('Just a moment') || pageHtml.includes('challenges.cloudflare.com')) {
-            console.log(`⚠️  ⚠️  ⚠️  Nog steeds op Cloudflare challenge pagina!`);
-            console.log(`   💡 Voltooi de challenge handmatig in het browser venster`);
-            console.log(`   💡 Na voltooiing worden cookies opgeslagen voor volgende requests`);
+            logger.warn('Still on Cloudflare challenge page - complete manually in browser window');
         }
-        
-        // Cookies are automatically saved to .browser-data by Puppeteer
         
         return pageHtml;
     } catch (error) {
-        console.error(`❌ Error fetching MultiUp page: ${error.message}`);
+        logger.error(`Error fetching MultiUp page: ${error.message}`);
         throw error;
     } finally {
-        // Always cleanup page - ensure it's closed and removed from tracking
         if (page) {
             try {
                 activePages.delete(page);
@@ -702,11 +617,9 @@ async function fetchMultiUpPage(url) {
                     await page.close().catch(() => {});
                 }
             } catch (e) {
-                // Ignore cleanup errors, but ensure it's removed from tracking
                 activePages.delete(page);
             }
         }
-        // Always release browser slot, even if cleanup failed
         releaseBrowserSlot();
     }
 }
@@ -714,66 +627,78 @@ async function fetchMultiUpPage(url) {
 // Fetch title from IMDB ID using Cinemeta
 async function getTitleFromImdbId(imdbId, type) {
     try {
-        console.log(`🔍 Fetching title from Cinemeta for ${imdbId}`);
+        logger.debug(`Fetching title from Cinemeta for ${imdbId}`);
         const response = await axios.get(`${CINEMETA_API_URL}/meta/${type}/${imdbId}.json`, {
             timeout: 10000
         });
         
         if (response.data && response.data.meta && response.data.meta.name) {
             const title = response.data.meta.name;
-            console.log(`✅ Found title: ${title}`);
+            logger.debug(`Found title: ${title}`);
             return title;
         }
         return null;
     } catch (error) {
-        console.error(`❌ Error fetching title from Cinemeta:`, error.message);
+        logger.error(`Error fetching title from Cinemeta: ${error.message}`);
         return null;
     }
 }
 
 // Helper function to format title for search
 function formatTitleForSearch(title, season, episode) {
-    // Replace special characters with spaces for better matching
     let searchTitle = title
-        .replace(/[^\w\s]/g, ' ')  // Replace special chars with spaces
-        .replace(/\s+/g, ' ')       // Normalize multiple spaces to single space
+        .replace(/[^\w\s]/g, ' ')
+        .replace(/\s+/g, ' ')
         .trim();
     
-    // Format season and episode as SxxExx
     const seasonStr = season.toString().padStart(2, '0');
     const episodeStr = episode.toString().padStart(2, '0');
     
-    // Search with title + season/episode, scnlog.me will handle the matching
     return `${searchTitle} S${seasonStr}E${episodeStr}`;
+}
+
+// Helper function to create error stream objects
+function createErrorStream(title, season, episode, errorReason, errorDescription) {
+    const titleLine1 = `📁  ${title} S${season.toString().padStart(2, '0')}E${episode.toString().padStart(2, '0')}`;
+    const titleLine2 = `❌ No stream links were found`;
+    const streamTitle = `${titleLine1}\n${titleLine2}`;
+    
+    const streamName = `❌  Streamzio`;
+    
+    // Combine "No stream links were found" with the error reason in the description
+    const fullDescription = `No stream links were found. ${errorDescription}`;
+    
+    return {
+        title: streamTitle,
+        name: streamName,
+        description: fullDescription,
+        externalUrl: 'about:blank' // Placeholder URL that will show the error message in Stremio
+    };
 }
 
 // Search scnlog.me for content
 async function searchScnlog(title, season, episode) {
     try {
         const searchQuery = formatTitleForSearch(title, season, episode);
-        console.log(`🔍 Searching scnlog.me for: ${searchQuery}`);
+        logger.debug(`Searching scnlog.me for: ${searchQuery}`);
         
-        // Search on scnlog.me
         const searchUrl = `https://scnlog.me/?s=${encodeURIComponent(searchQuery)}`;
         const response = await axios.get(searchUrl, {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             },
-            timeout: 15000  // Reduced from 30s to 15s for faster failure
+            timeout: 15000
         });
         
         const $ = cheerio.load(response.data);
         
-        // Find the first matching post link
         let postUrl = null;
         const titleLower = title.toLowerCase();
-        // Extract key words from title (remove common words, keep important ones)
         const titleWords = titleLower
             .split(/\s+/)
-            .filter(word => word.length > 2) // Filter out short words like "de", "the", etc.
+            .filter(word => word.length > 2)
             .filter(word => !['the', 'and', 'or', 'but', 'for', 'with'].includes(word));
         
-        // Season/episode pattern - flexible matching (S01E08, S1E8, etc.)
         const seasonStr = season.toString().padStart(2, '0');
         const episodeStr = episode.toString().padStart(2, '0');
         const searchPattern = new RegExp(`S0?${season}[Ee]0?${episode}`, 'i');
@@ -785,32 +710,29 @@ async function searchScnlog(title, season, episode) {
             if (href && href.includes('/foreign/')) {
                 const textLower = text.toLowerCase();
                 
-                // Check if it matches the season/episode pattern first (most important)
                 if (!searchPattern.test(text)) {
-                    return; // Skip if season/episode doesn't match
+                    return;
                 }
                 
-                // Check if title words match (flexible - at least 2 key words should match)
                 const matchingWords = titleWords.filter(word => textLower.includes(word));
                 
-                // If we have at least 2 matching words OR if title is short and at least 1 word matches
                 if (matchingWords.length >= Math.min(2, titleWords.length) || 
                     (titleWords.length <= 2 && matchingWords.length >= 1)) {
                     postUrl = href.startsWith('http') ? href : `https://scnlog.me${href}`;
-                    return false; // break
+                    return false;
                 }
             }
         });
         
         if (!postUrl) {
-            console.log(`❌ No matching post found for ${searchQuery}`);
+            logger.debug(`No matching post found for ${searchQuery}`);
             return null;
         }
         
-        console.log(`✅ Found post: ${postUrl}`);
+        logger.debug(`Found post: ${postUrl}`);
         return postUrl;
     } catch (error) {
-        console.error('❌ Error searching scnlog.me:', error.message);
+        logger.error(`Error searching scnlog.me: ${error.message}`);
         return null;
     }
 }
@@ -818,7 +740,7 @@ async function searchScnlog(title, season, episode) {
 // Extract MultiUp link from scnlog page
 async function extractMultiUpLink(postUrl) {
     try {
-        console.log(`📄 Fetching page: ${postUrl}`);
+        logger.debug(`Fetching page: ${postUrl}`);
         const response = await axios.get(postUrl, {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -828,30 +750,26 @@ async function extractMultiUpLink(postUrl) {
         
         const $ = cheerio.load(response.data);
         
-        // Look for MultiUp links - prioritize download links
         let multiUpLink = null;
         
-        // First, try to find download links (preferred)
         $('a[href*="multiup.io"], a[href*="multiup.org"]').each((i, elem) => {
             const href = $(elem).attr('href');
             if (href && href.includes('/download/')) {
                 multiUpLink = href;
-                return false; // break
+                return false;
             }
         });
         
-        // If no download link, try mirror links
         if (!multiUpLink) {
             $('a[href*="multiup.io"], a[href*="multiup.org"]').each((i, elem) => {
                 const href = $(elem).attr('href');
                 if (href && href.includes('/mirror/')) {
                     multiUpLink = href;
-                    return false; // break
+                    return false;
                 }
             });
         }
         
-        // Also check text content for MultiUp links
         if (!multiUpLink) {
             const textContent = $.text();
             const multiUpMatch = textContent.match(/https?:\/\/(?:www\.)?multiup\.(?:io|org)\/[^\s<>"']+/i);
@@ -861,39 +779,35 @@ async function extractMultiUpLink(postUrl) {
         }
         
         if (!multiUpLink) {
-            console.log(`❌ No MultiUp link found on page`);
+            logger.debug('No MultiUp link found on page');
             return null;
         }
         
-        console.log(`✅ Found MultiUp link: ${multiUpLink}`);
+        logger.debug(`Found MultiUp link: ${multiUpLink}`);
         return multiUpLink;
     } catch (error) {
-        console.error('❌ Error extracting MultiUp link:', error.message);
+        logger.error(`Error extracting MultiUp link: ${error.message}`);
         return null;
     }
 }
 
-// Extract quality (1080p/720p/2160p/4K) and scenegroup from scnlog post title
+// Extract quality and scenegroup from scnlog post title
 function extractMetadataFromPostTitle(postTitle) {
-    // Check for 4K first (can be written as 4K or 2160p)
     let quality = null;
     if (postTitle.match(/4k/i)) {
         quality = '4K';
     } else {
-        // Check for resolution patterns: 2160p, 1080p, 720p, etc.
         const qualityMatch = postTitle.match(/(\d{3,4}p)/i);
         if (qualityMatch) {
-            // Convert to lowercase 'p' and handle 2160p -> 4K if needed
             const res = qualityMatch[1].toLowerCase();
             if (res === '2160p') {
                 quality = '4K';
             } else {
-                quality = res; // e.g., '1080p', '720p'
+                quality = res;
             }
         }
     }
     
-    // Scenegroup is usually at the end after a dash, e.g., -TRIPEL, -MERCATOR
     const scenegroupMatch = postTitle.match(/-([A-Z]+)(?:\.mkv|\.mp4|\.avi|$)/i);
     const scenegroup = scenegroupMatch ? scenegroupMatch[1].toUpperCase() : null;
     
@@ -901,11 +815,9 @@ function extractMetadataFromPostTitle(postTitle) {
 }
 
 // Parse MultiUp h2 heading to extract filename and size
-// Format: " / Mirror list filename.ext ( size unit )"
 function parseMultiUpHeading(heading) {
     if (!heading) return { filename: null, size: null, sizeUnit: null };
     
-    // Extract size and unit: " ( 5.60 kB )" or " ( 1.2 GB )"
     const sizeMatch = heading.match(/\(\s*([\d.]+)\s+([KMGT]?B)\s*\)/i);
     if (sizeMatch) {
         const size = parseFloat(sizeMatch[1]);
@@ -920,7 +832,6 @@ function parseMultiUpHeading(heading) {
 function formatFileSize(size, unit) {
     if (!size || !unit) return '';
     
-    // Convert to GB if needed for display
     let displaySize = size;
     let displayUnit = unit;
     
@@ -932,32 +843,28 @@ function formatFileSize(size, unit) {
         displayUnit = 'GB';
     }
     
-    // Round to 2 decimal places
     displaySize = Math.round(displaySize * 100) / 100;
     
     return `${displaySize} ${displayUnit}`;
 }
 
-// Extract hoster links from MultiUp using Puppeteer (following MultiUp-Direct logic)
+// Extract hoster links from MultiUp
 async function extractHosterLinks(multiUpLink, postTitle = '') {
     try {
-        console.log(`🔗 Extracting hoster links from: ${multiUpLink}`);
+        logger.debug(`Extracting hoster links from: ${multiUpLink}`);
         
         let extractUrl = multiUpLink;
         
-        // If it's a download link, convert to mirror page
-        // Format: https://multiup.io/download/{id}/{filename}
         if (multiUpLink.includes('/download/')) {
             const match = multiUpLink.match(/\/download\/([a-f0-9]{32})/);
             if (match) {
                 extractUrl = `https://multiup.io/en/mirror/${match[1]}`;
-                console.log(`   Converted to mirror page: ${extractUrl}`);
+                logger.debug(`Converted to mirror page: ${extractUrl}`);
             } else {
-                console.log(`⚠️  Could not extract ID from download link`);
-                return [];
+                logger.warn('Could not extract ID from download link');
+                return { links: [], metadata: { quality: null, scenegroup: null, size: null, sizeUnit: null } };
             }
         } else if (multiUpLink.includes('/mirror/')) {
-            // Already a mirror link, ensure it has the /en/ prefix
             if (!multiUpLink.includes('/en/mirror/')) {
                 const match = multiUpLink.match(/\/mirror\/([a-f0-9]{32})/);
                 if (match) {
@@ -966,116 +873,75 @@ async function extractHosterLinks(multiUpLink, postTitle = '') {
             }
         }
         
-        // Fetch page using Puppeteer (handles Cloudflare automatically)
-        console.log(`📄 Fetching page: ${extractUrl}`);
+        logger.debug(`Fetching page: ${extractUrl}`);
         const pageHtml = await fetchMultiUpPage(extractUrl);
         
-        // Parse HTML with cheerio (like MultiUp-Direct uses scraper)
         const $ = cheerio.load(pageHtml);
         
-        // Extract h2 heading for filename and size (like MultiUp-Direct)
         const h2Selector = 'body > section > div > section > header > h2';
         const h2Element = $(h2Selector).first();
         const h2Text = h2Element.text().trim();
         const { size, sizeUnit } = parseMultiUpHeading(h2Text);
-        console.log(`📊 File size: ${size} ${sizeUnit || 'unknown'}`);
+        logger.debug(`File size: ${size} ${sizeUnit || 'unknown'}`);
         
-        // Extract links using EXACT selector as MultiUp-Direct: "button[type='submit'], a.host"
-        // MultiUp-Direct code exactly:
-        //   let host = button.attr("namehost").ok_or_else(...)?;
-        //   let link = button.attr("link").ok_or_else(...)?;
-        //   if link.starts_with("/") { continue; }
-        //   let validity = button.attr("validity").ok_or_else(...)?;
         const hosterLinks = [];
         
-        // Try multiple selectors to find hoster links
-        const buttons1 = $('button[type="submit"]');
-        const buttons2 = $('a.host');
-        const buttons3 = $('button[type="submit"], a.host');
-        console.log(`📊 Found ${buttons1.length} button[type="submit"] elements`);
-        console.log(`📊 Found ${buttons2.length} a.host elements`);
-        console.log(`📊 Found ${buttons3.length} combined button/a.host elements`);
-        
-        // Log page structure for debugging
-        const bodyHtml = $('body').html();
-        if (bodyHtml) {
-            console.log(`   Body HTML length: ${bodyHtml.length}`);
-            console.log(`   Body HTML preview: ${bodyHtml.substring(0, 500)}`);
-        }
-        
-        // Check for common MultiUp page elements
-        const hasSection = $('section').length > 0;
-        const hasHeader = $('header').length > 0;
-        console.log(`   Page structure: ${hasSection ? 'has section' : 'no section'}, ${hasHeader ? 'has header' : 'no header'}`);
-        
-        const buttons = buttons3;
+        const buttons = $('button[type="submit"], a.host');
         
         buttons.each((i, elem) => {
             try {
-                // Get attributes (HTML is case-insensitive, but cheerio might need exact case)
-                // Try lowercase first (as Rust code uses), then camelCase
                 let host = $(elem).attr('namehost');
                 if (!host) {
-                    host = $(elem).attr('nameHost');  // Fallback to camelCase
+                    host = $(elem).attr('nameHost');
                 }
                 
                 const link = $(elem).attr('link');
                 let validity = $(elem).attr('validity');
                 
-                // MultiUp-Direct requires all three attributes, skips if missing
                 if (!host || !link || !validity) {
-                    return; // Skip this element
+                    return;
                 }
                 
-                // Skip relative links (like MultiUp-Direct: if link.starts_with("/") { continue; })
                 if (link.startsWith('/')) {
                     return;
                 }
                 
-                // MultiUp-Direct creates DirectLink with host, link, validity
                 hosterLinks.push({
                     host: host,
                     url: link,
                     validity: validity
                 });
             } catch (error) {
-                // Skip elements with errors (like Rust's ok_or_else)
                 return;
             }
         });
         
-        console.log(`✅ Extracted ${hosterLinks.length} hoster links`);
+        logger.debug(`Extracted ${hosterLinks.length} hoster links`);
         
-        // Check for password protection (like MultiUp-Direct)
         const hasPassword = $('input[name="password"][type="password"]').length > 0;
         if (hasPassword) {
-            console.log(`⚠️  Page is password protected - skipping`);
+            logger.warn('Page is password protected - skipping');
             return { links: [], metadata: { quality: null, scenegroup: null, size: null, sizeUnit: null } };
         }
         
-        // Check for error messages (like MultiUp-Direct)
         const errorElement = $('.alert.alert-danger > strong').first();
         if (errorElement.length > 0) {
             const errorText = errorElement.text().trim();
             if (errorText && errorText.includes('could not be found')) {
-                console.log(`❌ File not found: ${errorText}`);
+                logger.error(`File not found: ${errorText}`);
                 return { links: [], metadata: { quality: null, scenegroup: null, size: null, sizeUnit: null } };
             }
         }
         
         if (hosterLinks.length === 0) {
-            console.log(`❌ No hoster links found`);
+            logger.warn('No hoster links found');
             return { links: [], metadata: { quality: null, scenegroup: null, size: null, sizeUnit: null } };
         }
         
-        // Filter to only valid links - skip invalid and unknown hosters
-        // Only hosters with validity="valid" will be processed
         const validLinks = hosterLinks.filter(link => link.validity === 'valid');
         
         if (validLinks.length === 0) {
-            console.log(`⚠️  Found ${hosterLinks.length} hoster links, but none are valid (all marked as invalid/unknown)`);
-            console.log(`   Skipping Real-Debrid processing to avoid unnecessary API calls`);
-            // Extract metadata from post title for logging
+            logger.warn(`Found ${hosterLinks.length} hoster links, but none are valid`);
             const { quality, scenegroup } = extractMetadataFromPostTitle(postTitle);
             return {
                 links: [],
@@ -1088,10 +954,9 @@ async function extractHosterLinks(multiUpLink, postTitle = '') {
             };
         }
         
-        // Extract metadata from post title
         const { quality, scenegroup } = extractMetadataFromPostTitle(postTitle);
         
-        console.log(`✅ Found ${validLinks.length} valid hoster links (skipped ${hosterLinks.length - validLinks.length} invalid/unknown)`);
+        logger.info(`Found ${validLinks.length} valid hoster links (skipped ${hosterLinks.length - validLinks.length} invalid/unknown)`);
         return {
             links: validLinks,
             metadata: {
@@ -1102,20 +967,16 @@ async function extractHosterLinks(multiUpLink, postTitle = '') {
             }
         };
     } catch (error) {
-        // Don't close browser on error - keep it alive for next request
-        console.error('❌ Error extracting hoster links:', error.message);
-        console.error('Stack:', error.stack);
+        logger.error(`Error extracting hoster links: ${error.message}`);
         return { links: [], metadata: { quality: null, scenegroup: null, size: null, sizeUnit: null } };
     }
 }
 
-
 // Add link to Real-Debrid and get streaming URL
 async function getRealDebridStream(link, apiKey) {
     try {
-        console.log(`🔓 Adding to Real-Debrid: ${link}`);
+        logger.debug(`Adding to Real-Debrid: ${link}`);
         
-        // Use Real-Debrid unrestrict API
         const response = await axios.post(
             `${REALDEBRID_API_URL}/unrestrict/link`,
             `link=${encodeURIComponent(link)}`,
@@ -1131,7 +992,7 @@ async function getRealDebridStream(link, apiKey) {
         const data = response.data;
         
         if (data.download) {
-            console.log(`✅ Real-Debrid stream ready: ${data.download}`);
+            logger.debug(`Real-Debrid stream ready: ${data.download}`);
             return {
                 url: data.download,
                 filename: data.filename || null,
@@ -1141,33 +1002,27 @@ async function getRealDebridStream(link, apiKey) {
         
         return null;
     } catch (error) {
-        // Parse Real-Debrid error response
         const errorData = error.response?.data || {};
         const errorCode = errorData.error_code;
         const errorMsg = errorData.error || error.message;
         
-        // Extract hoster name from link for better error messages
         let hosterName = 'unknown';
         try {
             const urlObj = new URL(link);
             hosterName = urlObj.hostname.replace('www.', '').split('.')[0];
         } catch (e) {
-            // If URL parsing fails, try to extract from link string
             const hosterMatch = link.match(/https?:\/\/(?:www\.)?([^\/]+)/);
             if (hosterMatch) {
                 hosterName = hosterMatch[1].split('.')[0];
             }
         }
         
-        // Log specific error types with clear messages
         if (errorCode === 16 || errorMsg === 'hoster_unsupported' || errorMsg?.includes('unsupported')) {
-            console.log(`🚫 Hoster not supported by Real-Debrid: ${hosterName} (error_code: ${errorCode || 'N/A'})`);
-            console.log(`   💡 Real-Debrid does not support this hoster. Trying next hoster...`);
+            logger.warn(`Hoster not supported by Real-Debrid: ${hosterName} (error_code: ${errorCode || 'N/A'})`);
         } else if (errorCode === 24 || errorMsg === 'unavailable_file' || errorMsg?.includes('unavailable')) {
-            console.log(`⚠️  File unavailable on Real-Debrid: ${hosterName} (error_code: ${errorCode || 'N/A'})`);
-            console.log(`   💡 The file may have been deleted or is no longer accessible. Trying next hoster...`);
+            logger.warn(`File unavailable on Real-Debrid: ${hosterName} (error_code: ${errorCode || 'N/A'})`);
         } else {
-            console.log(`❌ Real-Debrid error for ${hosterName}: ${errorMsg || 'Unknown error'} (error_code: ${errorCode || 'N/A'})`);
+            logger.error(`Real-Debrid error for ${hosterName}: ${errorMsg || 'Unknown error'} (error_code: ${errorCode || 'N/A'})`);
         }
         
         return null;
@@ -1185,7 +1040,6 @@ function withTimeout(promise, timeoutMs, operationName) {
     
     return Promise.race([
         promise.finally(() => {
-            // Clear timeout if promise resolves/rejects before timeout
             if (timeoutId) {
                 clearTimeout(timeoutId);
             }
@@ -1197,140 +1051,148 @@ function withTimeout(promise, timeoutMs, operationName) {
 // Stream Handler
 builder.defineStreamHandler(async ({ type, id }) => {
     const requestStartTime = Date.now();
-    console.log(`\n📺 Stream request received: type=${type}, id=${id}`);
+    logger.info(`Stream request received: type=${type}, id=${id}`);
     
-    // Check if we're shutting down
     if (isShuttingDown) {
-        console.log('⚠️  Server is shutting down, rejecting request');
+        logger.warn('Server is shutting down, rejecting request');
         return { streams: [] };
     }
     
     const config = getConfig();
     
     if (!config.realdebrid.apiKey || !config.realdebrid.enabled) {
-        console.log('⚠️  Real-Debrid not configured');
+        logger.warn('Real-Debrid not configured');
         return { streams: [] };
     }
     
-    // Wrap entire handler in timeout (120 seconds total)
     try {
         return await withTimeout(
             handleStreamRequest(type, id, requestStartTime, config),
-            120000,
+            REQUEST_TIMEOUT_MS,
             'Stream request'
         );
     } catch (error) {
         if (error.message.includes('timed out')) {
-            console.error(`❌ Request timed out: ${error.message}`);
+            logger.error(`Request timed out: ${error.message}`);
         } else {
-            console.error(`❌ Error in stream handler: ${error.message}`);
-            console.error('Stack:', error.stack);
+            logger.error(`Error in stream handler: ${error.message}`);
         }
         return { streams: [] };
     }
 });
 
-// Actual stream request handler (extracted for timeout wrapper)
+// Stream request handler
 async function handleStreamRequest(type, id, requestStartTime, config) {
     try {
-        // Parse the ID to extract title, season, episode
-        // Stremio uses IMDB IDs: tt123456:season:episode for series
-        // Or custom IDs: title:season:episode
         const parts = id.split(':');
         
         if (type === 'series' && parts.length >= 3) {
-            const imdbId = parts[0]; // e.g., "tt123456"
+            const imdbId = parts[0];
             const season = parseInt(parts[parts.length - 2]);
             const episode = parseInt(parts[parts.length - 1]);
             
-            // Validate season and episode
             if (isNaN(season) || isNaN(episode) || season < 1 || episode < 1) {
-                console.log(`❌ Invalid season/episode: S${season}E${episode}`);
+                logger.warn(`Invalid season/episode: S${season}E${episode}`);
                 return { streams: [] };
             }
             
-            // Check cache first (only for IMDB IDs)
             if (imdbId.startsWith('tt')) {
                 const cachedStreams = getCachedStreams(imdbId, season, episode);
                 if (cachedStreams) {
                     const cacheTime = Date.now() - requestStartTime;
-                    console.log(`⚡ Returning ${cachedStreams.length} cached streams for ${imdbId} S${season}E${episode} (${cacheTime}ms)`);
+                    logger.info(`Returning ${cachedStreams.length} cached streams for ${imdbId} S${season}E${episode} (${cacheTime}ms)`);
                     return { streams: cachedStreams };
                 }
             }
             
-            // Check if it's an IMDB ID (starts with "tt")
             let title = null;
             if (imdbId.startsWith('tt')) {
-                // For IMDB IDs, fetch the title from Cinemeta
                 title = await getTitleFromImdbId(imdbId, type);
                 if (!title) {
-                    console.log(`❌ Could not fetch title for IMDB ID: ${imdbId}`);
+                    logger.warn(`Could not fetch title for IMDB ID: ${imdbId}`);
                     return { streams: [] };
                 }
             } else {
-                // Title-based ID
-                title = parts.slice(0, -2).join(':'); // Handle titles with colons
+                title = parts.slice(0, -2).join(':');
             }
             
             if (!title) {
-                console.log(`❌ No title found in ID: ${id}`);
+                logger.warn(`No title found in ID: ${id}`);
                 return { streams: [] };
             }
             
-            console.log(`🎬 Processing: ${title} S${season}E${episode}`);
+            logger.info(`Processing: ${title} S${season}E${episode}`);
             
-            // Search scnlog.me
             const searchStartTime = Date.now();
             const postUrl = await searchScnlog(title, season, episode);
             const searchTime = Date.now() - searchStartTime;
-            console.log(`⏱️  Search took ${searchTime}ms`);
+            logger.timing('Search', searchTime);
+            
             if (!postUrl) {
-                console.log(`✅ Returning empty streams (no post found)`);
-                // Cleanup browser pages before returning
+                logger.info('No post found - returning error stream');
                 await cleanupBrowserPages();
-                return { streams: [] };
+                const errorStream = createErrorStream(
+                    title,
+                    season,
+                    episode,
+                    'No scnlog post found',
+                    'No matching post found on scnlog.me for this episode'
+                );
+                return { streams: [errorStream] };
             }
             
-            // Extract MultiUp link
             const extractStartTime = Date.now();
             const multiUpLink = await extractMultiUpLink(postUrl);
             const extractTime = Date.now() - extractStartTime;
-            console.log(`⏱️  MultiUp extraction took ${extractTime}ms`);
+            logger.timing('MultiUp extraction', extractTime);
+            
             if (!multiUpLink) {
-                console.log(`✅ Returning empty streams (no MultiUp link found)`);
-                // Cleanup browser pages before returning
+                logger.info('No MultiUp link found - returning error stream');
                 await cleanupBrowserPages();
-                return { streams: [] };
+                const errorStream = createErrorStream(
+                    title,
+                    season,
+                    episode,
+                    'No MultiUp link found',
+                    'No MultiUp download link found on the scnlog.me post'
+                );
+                return { streams: [errorStream] };
             }
             
-            // Get post title for metadata extraction (from the actual post heading, not page title)
             const postTitleResponse = await axios.get(postUrl, { timeout: 15000 }).catch(() => null);
             let postTitle = '';
             if (postTitleResponse) {
                 const $post = cheerio.load(postTitleResponse.data);
-                // Try to get the post title from common scnlog.me selectors
                 postTitle = $post('h1.post-title, h1.entry-title, .post-title, .entry-title').first().text().trim() ||
                            $post('h1').first().text().trim() ||
                            $post('title').text();
             }
             
-            // Extract hoster links with metadata
             const hosterStartTime = Date.now();
             const { links: hosterLinks, metadata } = await extractHosterLinks(multiUpLink, postTitle);
             const hosterTime = Date.now() - hosterStartTime;
-            console.log(`⏱️  Hoster extraction took ${hosterTime}ms`);
+            logger.timing('Hoster extraction', hosterTime);
+            
             if (hosterLinks.length === 0) {
-                console.log(`✅ Returning empty streams (no hoster links found)`);
-                // Cleanup browser pages before returning
+                logger.info('No valid hoster links found - returning error stream');
                 await cleanupBrowserPages();
-                return { streams: [] };
+                // Check if metadata exists (means hosters were found but invalid)
+                const hasMetadata = metadata && (metadata.quality || metadata.scenegroup);
+                const errorReason = hasMetadata ? 'No valid hosters' : 'No hoster links found';
+                const errorDescription = hasMetadata 
+                    ? 'Hoster links found on MultiUp, but none are valid or supported by Real-Debrid'
+                    : 'No hoster download links found on the MultiUp mirror page';
+                const errorStream = createErrorStream(
+                    title,
+                    season,
+                    episode,
+                    errorReason,
+                    errorDescription
+                );
+                return { streams: [errorStream] };
             }
             
-            // Format stream title and subtitle (swapped)
-            // Quality should be lowercase 'p' (1080p, 720p, 4K)
             let qualityDisplay = metadata.quality || 'Unknown';
-            // Ensure quality ends with lowercase 'p' if it's a resolution (not 4K)
             if (qualityDisplay !== '4K' && qualityDisplay.match(/\d+p/i)) {
                 qualityDisplay = qualityDisplay.toLowerCase();
             }
@@ -1338,86 +1200,82 @@ async function handleStreamRequest(type, id, requestStartTime, config) {
             const sizeDisplay = formatFileSize(metadata.size, metadata.sizeUnit);
             const scenegroupDisplay = metadata.scenegroup || 'Unknown';
             
-            // Get Real-Debrid streams - try hoster links until we find one that works
-            // Stop after first successful stream (we don't need multiple streams for the same video)
             const rdStartTime = Date.now();
             const streams = [];
             for (const hosterLink of hosterLinks) {
                 try {
                     const stream = await getRealDebridStream(hosterLink.url, config.realdebrid.apiKey);
                     if (stream) {
-                        // Title: "📁 'Movie/series Title' SxxExx\n💾 x GB   🏷️ 'Scenegroup name'\n🔎 'hoster'"
-                        const titleLine1 = `📁 ${title} S${season.toString().padStart(2, '0')}E${episode.toString().padStart(2, '0')}`;
+                        const titleLine1 = `📁  ${title} S${season.toString().padStart(2, '0')}E${episode.toString().padStart(2, '0')}`;
                         const titleLine2Parts = [];
                         
                         if (sizeDisplay) {
-                            titleLine2Parts.push(`💾 ${sizeDisplay}`);
+                            titleLine2Parts.push(`💾  ${sizeDisplay}`);
                         }
                         
-                        titleLine2Parts.push(`🏷️ ${scenegroupDisplay}`);
+                        titleLine2Parts.push(`🏷️  ${scenegroupDisplay}`);
                         
-                        const titleLine2 = titleLine2Parts.join('   '); // 3 spaces between GB and 🏷️
-                        const titleLine3 = `🔎 ${hosterLink.host}`;
+                        const titleLine2 = titleLine2Parts.join('   ');
+                        const titleLine3 = `🔎  ${hosterLink.host}`;
                         const streamTitle = `${titleLine1}\n${titleLine2}\n${titleLine3}`;
                         
-                        // Subtitle: "Streamzio 1080p" (lowercase p)
                         const streamSubtitle = `Streamzio ${qualityDisplay}`;
                         
                         streams.push({
                             title: streamTitle,
-                            name: streamSubtitle,  // Use 'name' for subtitle in Stremio
+                            name: streamSubtitle,
                             url: stream.url,
                             behaviorHints: {
                                 bingeGroup: `${title}-S${season}E${episode}`,
                                 notWebReady: false
                             }
                         });
-                        console.log(`✅ Added stream from ${hosterLink.host}`);
-                        // Stop after first successful stream - we don't need multiple streams
+                        logger.info(`Added stream from ${hosterLink.host}`);
                         break;
                     }
                 } catch (error) {
-                    // Error is already logged in getRealDebridStream function with detailed messages
-                    // Continue to next hoster
+                    // Error already logged in getRealDebridStream
                 }
             }
             
-            // Cleanup browser pages after Real-Debrid processing (whether successful or not)
             await cleanupBrowserPages();
             
-            // Cache the streams if we have an IMDB ID and got results
+            if (streams.length === 0) {
+                logger.info('Real-Debrid failed for all hosters - returning error stream');
+                const errorStream = createErrorStream(
+                    title,
+                    season,
+                    episode,
+                    'No valid hosters',
+                    `Found ${hosterLinks.length} valid hoster link(s), but Real-Debrid failed to process them (hosters may be unsupported or files unavailable)`
+                );
+                return { streams: [errorStream] };
+            }
+            
             if (imdbId.startsWith('tt') && streams.length > 0) {
                 setCachedStreams(imdbId, season, episode, streams);
             }
             
             const rdTime = Date.now() - rdStartTime;
             const totalTime = Date.now() - requestStartTime;
-            console.log(`⏱️  Real-Debrid processing took ${rdTime}ms`);
-            console.log(`⏱️  Total request time: ${totalTime}ms`);
-            console.log(`✅ Returning ${streams.length} stream(s)`);
+            logger.timing('Real-Debrid processing', rdTime);
+            logger.timing('Total request', totalTime);
+            logger.info(`Returning ${streams.length} stream(s)`);
             
-            // Cleanup already done after Real-Debrid processing
             return { streams };
         } else if (type === 'movie' && parts.length >= 2) {
             const title = parts.slice(1).join(':');
-            
-            console.log(`\n🎬 Request for movie: ${title}`);
-            
-            // For movies, search without season/episode
-            // This would need a different search strategy
-            // For now, return empty
+            logger.info(`Request for movie: ${title} (not supported yet)`);
             return { streams: [] };
         }
         
         return { streams: [] };
     } catch (error) {
-        console.error('❌ Error in stream handler:', error);
-        console.error('Stack:', error.stack);
-        // Ensure cleanup happens even on error
+        logger.error(`Error in stream handler: ${error.message}`);
         try {
             await cleanupBrowserPages();
         } catch (cleanupError) {
-            console.log(`⚠️  Cleanup error in catch block: ${cleanupError.message}`);
+            logger.warn(`Cleanup error: ${cleanupError.message}`);
         }
         return { streams: [] };
     }
@@ -1428,9 +1286,8 @@ async function gracefulShutdown() {
     if (isShuttingDown) return;
     isShuttingDown = true;
     
-    console.log('\n🛑 Starting graceful shutdown...');
+    logger.info('Starting graceful shutdown');
     
-    // Close all active pages
     const pageClosePromises = Array.from(activePages).map(page => {
         try {
             if (!page.isClosed()) {
@@ -1443,14 +1300,13 @@ async function gracefulShutdown() {
     await Promise.all(pageClosePromises);
     activePages.clear();
     
-    // Close browser
     if (globalBrowser && globalBrowser.isConnected()) {
         try {
-            console.log('   Closing browser...');
+            logger.info('Closing browser');
             await globalBrowser.close();
-            console.log('   Browser closed');
+            logger.info('Browser closed');
         } catch (error) {
-            console.log(`   Error closing browser: ${error.message}`);
+            logger.warn(`Error closing browser: ${error.message}`);
         }
     }
     
@@ -1458,16 +1314,15 @@ async function gracefulShutdown() {
     browserInitializing = false;
     browserInitPromise = null;
     
-    // Clear periodic cleanup interval
     if (periodicCleanupInterval) {
         clearInterval(periodicCleanupInterval);
         periodicCleanupInterval = null;
     }
     
-    console.log('✅ Graceful shutdown complete');
+    logger.info('Graceful shutdown complete');
 }
 
-// Setup signal handlers for graceful shutdown
+// Setup signal handlers
 process.on('SIGTERM', async () => {
     await gracefulShutdown();
     process.exit(0);
@@ -1478,21 +1333,18 @@ process.on('SIGINT', async () => {
     process.exit(0);
 });
 
-// Handle uncaught errors
 process.on('unhandledRejection', (reason, promise) => {
-    console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
-    // Log stack trace if available
+    logger.error(`Unhandled Rejection: ${reason}`);
     if (reason && reason.stack) {
-        console.error('Stack:', reason.stack);
+        logger.error(`Stack: ${reason.stack}`);
     }
-    // Don't exit - log and continue, but ensure cleanup
     cleanupBrowserPages().catch(err => {
-        console.error('⚠️  Cleanup failed in unhandled rejection:', err.message);
+        logger.warn(`Cleanup failed in unhandled rejection: ${err.message}`);
     });
 });
 
 process.on('uncaughtException', (error) => {
-    console.error('❌ Uncaught Exception:', error);
+    logger.error(`Uncaught Exception: ${error.message}`);
     gracefulShutdown().then(() => {
         process.exit(1);
     });
@@ -1503,39 +1355,30 @@ async function startServer() {
     const config = getConfig();
     
     if (!config.realdebrid.apiKey || !config.realdebrid.enabled) {
-        console.log('⚠️  Real-Debrid not configured. Please set REALDEBRID_API_KEY or edit config.json');
+        logger.warn('Real-Debrid not configured. Please set REALDEBRID_API_KEY or edit config.json');
     }
     
-    // Pre-start browser for faster first request
     preStartBrowser().catch(err => {
-        console.log(`⚠️  Browser pre-start error: ${err.message}`);
+        logger.warn(`Browser pre-start error: ${err.message}`);
     });
     
     const httpPort = config.server.port || 7004;
     const app = express();
     
-    // Dynamic base URL detection from requests
     app.use((req, _res, next) => {
         try {
             const host = req.headers.host;
             if (host) {
-                // Detect protocol from request (Localtunnel uses HTTPS)
-                // Check X-Forwarded-Proto header (set by reverse proxies/tunnels)
                 const proto = req.headers['x-forwarded-proto'] || 
                              (req.secure ? 'https' : 'http');
-                // Update dynamic base URL based on the request
-                // This ensures logo uses the correct host and protocol
                 dynamicBaseUrl = `${proto}://${host}`;
             }
         } catch (_e) {}
         next();
     });
     
-    // Serve static files (logo, etc.)
     app.use(express.static(__dirname));
     
-    // Custom manifest.json route BEFORE router (to serve dynamic logo URL)
-    // The router's manifest handler uses cached manifest, so we intercept it
     app.get('/manifest.json', (req, res) => {
         const baseUrl = getPublicBaseUrl();
         const dynamicManifest = {
@@ -1555,12 +1398,10 @@ async function startServer() {
         res.json(dynamicManifest);
     });
     
-    // Mount Stremio addon router (handles resource endpoints)
     const addonInterface = builder.getInterface();
     const router = getRouter(addonInterface);
     app.use(router);
     
-    // Health check endpoint
     app.get('/health', (req, res) => {
         res.json({
             status: 'ok',
@@ -1569,7 +1410,6 @@ async function startServer() {
         });
     });
     
-    // Info endpoint
     app.get('/', (req, res) => {
         res.json({
             status: 'online',
@@ -1584,26 +1424,23 @@ async function startServer() {
         });
     });
     
-    // Start HTTP server
     const server = app.listen(httpPort, '127.0.0.1', () => {
-        console.log(`\n🌐 Streamzio server running on port ${httpPort}`);
-        console.log(`📡 Install in Stremio:`);
-        console.log(`   http://localhost:${httpPort}/manifest.json`);
-        console.log(`\n⚠️  For network access, use HTTPS (e.g., via localtunnel)`);
+        logger.info(`Streamzio server running on port ${httpPort}`);
+        logger.info(`Install in Stremio: http://localhost:${httpPort}/manifest.json`);
+        logger.info('For network access, use HTTPS (e.g., via localtunnel)');
     });
     
     server.on('error', (error) => {
         if (error.code === 'EADDRINUSE') {
-            console.error(`\n❌ Port ${httpPort} is already in use.`);
-            console.error(`   Please stop the other process or use a different port.`);
+            logger.error(`Port ${httpPort} is already in use`);
+            logger.error('Please stop the other process or use a different port');
             process.exit(1);
         } else {
-            console.error('❌ HTTP server error:', error);
+            logger.error(`HTTP server error: ${error.message}`);
             process.exit(1);
         }
     });
     
-    // Handle server close
     server.on('close', async () => {
         await gracefulShutdown();
     });
@@ -1611,10 +1448,9 @@ async function startServer() {
 
 if (require.main === module) {
     startServer().catch((error) => {
-        console.error('❌ Failed to start server:', error);
+        logger.error(`Failed to start server: ${error.message}`);
         process.exit(1);
     });
 }
 
 module.exports = { startServer };
-

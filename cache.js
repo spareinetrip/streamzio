@@ -15,7 +15,7 @@ function loadCache() {
         }
         return DEFAULT_CACHE;
     } catch (error) {
-        console.error('❌ Error loading cache:', error.message);
+        console.error(`[CACHE] ERROR: Failed to load cache: ${error.message}`);
         return DEFAULT_CACHE;
     }
 }
@@ -26,7 +26,7 @@ function saveCache(cache) {
         fs.writeFileSync(CACHE_PATH, JSON.stringify(cache, null, 2));
         return true;
     } catch (error) {
-        console.error('❌ Error saving cache:', error.message);
+        console.error(`[CACHE] ERROR: Failed to save cache: ${error.message}`);
         return false;
     }
 }
@@ -42,18 +42,15 @@ function getCachedStreams(imdbId, season, episode) {
     const key = getCacheKey(imdbId, season, episode);
     
     if (cache[key]) {
-        console.log(`💾 Cache hit for ${key}`);
         return cache[key];
     }
     
-    console.log(`💾 Cache miss for ${key}`);
     return null;
 }
 
 // Store streams in cache for a given IMDB ID, season, and episode
 function setCachedStreams(imdbId, season, episode, streams) {
     if (!streams || streams.length === 0) {
-        // Don't cache empty results
         return;
     }
     
@@ -62,7 +59,6 @@ function setCachedStreams(imdbId, season, episode, streams) {
     
     cache[key] = streams;
     saveCache(cache);
-    console.log(`💾 Cached ${streams.length} streams for ${key}`);
 }
 
 // Clear cache (useful for debugging or manual cache invalidation)
@@ -70,10 +66,10 @@ function clearCache() {
     try {
         if (fs.existsSync(CACHE_PATH)) {
             fs.unlinkSync(CACHE_PATH);
-            console.log('✅ Cache cleared');
+            console.log('[CACHE] Cache cleared');
         }
     } catch (error) {
-        console.error('❌ Error clearing cache:', error.message);
+        console.error(`[CACHE] ERROR: Failed to clear cache: ${error.message}`);
     }
 }
 

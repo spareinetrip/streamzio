@@ -15,7 +15,7 @@ const DEFAULT_CONFIG = {
     }
 };
 
-// Load configuration
+// Load configuration from file
 function loadConfig() {
     try {
         if (fs.existsSync(CONFIG_PATH)) {
@@ -27,23 +27,22 @@ function loadConfig() {
                 server: { ...DEFAULT_CONFIG.server, ...config.server }
             };
         } else {
-            // Create default config file
             saveConfig(DEFAULT_CONFIG);
             return DEFAULT_CONFIG;
         }
     } catch (error) {
-        console.error('❌ Error loading config:', error);
+        console.error(`[CONFIG] ERROR: Failed to load config: ${error.message}`);
         return DEFAULT_CONFIG;
     }
 }
 
-// Save configuration
+// Save configuration to file
 function saveConfig(config) {
     try {
         fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
         return true;
     } catch (error) {
-        console.error('❌ Error saving config:', error);
+        console.error(`[CONFIG] ERROR: Failed to save config: ${error.message}`);
         return false;
     }
 }
@@ -59,7 +58,10 @@ function getConfig() {
     }
     
     if (process.env.PORT) {
-        config.server.port = parseInt(process.env.PORT);
+        const port = parseInt(process.env.PORT);
+        if (!isNaN(port) && port > 0 && port < 65536) {
+            config.server.port = port;
+        }
     }
     
     if (process.env.PUBLIC_BASE_URL) {
@@ -75,4 +77,3 @@ module.exports = {
     getConfig,
     CONFIG_PATH
 };
-
