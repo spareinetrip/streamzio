@@ -166,11 +166,30 @@ TUNNEL_PID=$!
 echo "   Tunnel started with PID: $TUNNEL_PID"
 echo "✅ Both services started successfully"
 
-# Wait for both processes - if either dies, exit
-wait -n "$STREAMZIO_PID" "$TUNNEL_PID" || {
-    EXIT_CODE=$?
-    echo "❌ One of the processes exited with code $EXIT_CODE"
-    cleanup
-    exit $EXIT_CODE
-}
+# Monitor both processes - restart tunnel if it exits, but exit if streamzio dies
+while true; do
+    # Wait for either process to exit
+    wait -n "$STREAMZIO_PID" "$TUNNEL_PID" 2>/dev/null || EXIT_CODE=$?
+    
+    # Check which process exited
+    if ! kill -0 "$STREAMZIO_PID" 2>/dev/null; then
+        # Streamzio died - this is fatal, shut down everything
+        echo "❌ Streamzio process (PID: $STREAMZIO_PID) exited with code $EXIT_CODE"
+        cleanup
+        exit $EXIT_CODE
+    elif ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+        # Tunnel died - restart it instead of shutting down
+        echo "⚠️  Tunnel process (PID: $TUNNEL_PID) exited. Restarting tunnel..."
+        wait "$TUNNEL_PID" 2>/dev/null || true  # Wait for it to fully exit
+        
+        # Restart tunnel
+        echo "🚀 Restarting localtunnel..."
+        node start-tunnel.js &
+        TUNNEL_PID=$!
+        echo "   Tunnel restarted with PID: $TUNNEL_PID"
+    else
+        # Both still running, continue monitoring
+        sleep 1
+    fi
+done
 

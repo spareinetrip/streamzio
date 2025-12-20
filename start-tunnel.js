@@ -334,6 +334,129 @@ async function checkSubdomainActive(deviceId) {
     }
 }
 
+// Check if tunnel URL is still accessible (health check)
+async function checkTunnelHealth(tunnelUrl) {
+    if (!tunnelUrl) {
+        return false;
+    }
+    
+    try {
+        const https = require('https');
+        
+        return new Promise((resolve) => {
+            // Try to access the manifest endpoint to verify tunnel is working
+            const manifestUrl = `${tunnelUrl}/manifest.json`;
+            const req = https.get(manifestUrl, { timeout: 5000 }, (res) => {
+                // If we get a response (even error codes), tunnel is active
+                resolve(res.statusCode < 500); // 5xx errors might indicate tunnel is down
+            });
+            
+            req.on('error', (err) => {
+                // Connection errors mean tunnel is likely down
+                resolve(false);
+            });
+            
+            req.on('timeout', () => {
+                req.destroy();
+                resolve(false);
+            });
+            
+            setTimeout(() => {
+                req.destroy();
+                resolve(false);
+            }, 5000);
+        });
+    } catch (error) {
+        return false;
+    }
+}
+
+// Start periodic health check for tunnel connection
+function startHealthCheck(tunnelUrl, deviceId, port, maxRetries, ltProcess) {
+    // Clear any existing health check interval
+    if (globalHealthCheckInterval) {
+        clearInterval(globalHealthCheckInterval);
+        globalHealthCheckInterval = null;
+    }
+    
+    // Check every 10 minutes (600000ms) - localtunnel typically times out after 30+ minutes of inactivity
+    const HEALTH_CHECK_INTERVAL = 10 * 60 * 1000; // 10 minutes
+    
+    console.log(`💓 Starting tunnel health check (checking every ${HEALTH_CHECK_INTERVAL / 60000} minutes)...`);
+    
+    let checkCount = 0;
+    globalHealthCheckInterval = setInterval(async () => {
+        checkCount++;
+        
+        // Check if the tunnel process is still running
+        let processAlive = false;
+        try {
+            if (ltProcess && ltProcess.pid) {
+                process.kill(ltProcess.pid, 0); // Signal 0 checks if process exists
+                processAlive = true;
+            }
+        } catch (e) {
+            // Process is dead
+            processAlive = false;
+        }
+        
+        // Check if tunnel URL is still accessible
+        const tunnelHealthy = await checkTunnelHealth(tunnelUrl);
+        
+        if (!processAlive || !tunnelHealthy) {
+            console.log(`⚠️  Tunnel health check failed! Process alive: ${processAlive}, URL accessible: ${tunnelHealthy}`);
+            console.log(`🔄 Restarting tunnel proactively...`);
+            
+            // Clear health check interval
+            if (globalHealthCheckInterval) {
+                clearInterval(globalHealthCheckInterval);
+                globalHealthCheckInterval = null;
+            }
+            
+            // Kill the dead/unresponsive tunnel process if it's still running
+            if (ltProcess && !ltProcess.killed && ltProcess.pid) {
+                try {
+                    console.log(`   Stopping unresponsive tunnel process...`);
+                    try {
+                        process.kill(-ltProcess.pid, 'SIGTERM');
+                    } catch (e) {
+                        ltProcess.kill('SIGTERM');
+                    }
+                    // Wait a bit for graceful shutdown
+                    await new Promise(resolve => setTimeout(resolve, 3000));
+                    // Force kill if still running
+                    try {
+                        process.kill(-ltProcess.pid, 'SIGKILL');
+                    } catch (e) {
+                        ltProcess.kill('SIGKILL');
+                    }
+                } catch (e) {
+                    // Process already dead, that's fine
+                }
+            }
+            
+            // Cleanup stale processes
+            await cleanupStaleProcesses(deviceId, port);
+            
+            // Check if subdomain is still active
+            console.log(`🔍 Checking if subdomain ${deviceId} is still active...`);
+            const isActive = await checkSubdomainActive(deviceId);
+            if (isActive) {
+                console.log(`⚠️  Subdomain ${deviceId} is still active! Waiting for it to be released...`);
+                await new Promise(resolve => setTimeout(resolve, 10000));
+            }
+            
+            // Restart tunnel
+            startTunnelInternal(deviceId, port, 0, maxRetries);
+        } else {
+            // Tunnel is healthy, log periodically (every 6th check = 1 hour)
+            if (checkCount % 6 === 0) {
+                console.log(`✅ Tunnel health check passed - tunnel is active and accessible`);
+            }
+        }
+    }, HEALTH_CHECK_INTERVAL);
+}
+
 // Start Localtunnel with retry logic
 async function startTunnel(retryCount = 0) {
     const MAX_RETRIES = 3;
@@ -367,6 +490,9 @@ async function startTunnel(retryCount = 0) {
     
     startTunnelInternal(deviceId, port, retryCount, MAX_RETRIES);
 }
+
+// Global health check interval tracker (one per tunnel instance)
+let globalHealthCheckInterval = null;
 
 function startTunnelInternal(deviceId, port, retryCount, maxRetries) {
     console.log(`🚀 Starting Localtunnel with subdomain: ${deviceId}`);
@@ -466,6 +592,9 @@ function startTunnelInternal(deviceId, port, retryCount, maxRetries) {
                         updateConfigWithTunnelUrl(tunnelUrl);
                         urlUpdated = true;
                         urlVerified = true;
+                        
+                        // Start periodic health check to detect inactivity/disconnections
+                        startHealthCheck(tunnelUrl, deviceId, port, maxRetries, lt);
                         break;
                     }
                 }
@@ -491,9 +620,47 @@ function startTunnelInternal(deviceId, port, retryCount, maxRetries) {
     lt.on('close', (code) => {
         clearTimeout(startupTimeout);
         
+        // Clear health check interval when tunnel closes
+        if (globalHealthCheckInterval) {
+            clearInterval(globalHealthCheckInterval);
+            globalHealthCheckInterval = null;
+        }
+        
         // Don't retry if we're shutting down gracefully
         if (isShuttingDown) {
             releaseLock();
+            return;
+        }
+        
+        // If tunnel closed unexpectedly after successful startup, restart it automatically
+        if (urlVerified && code === 0 && !hasError) {
+            console.log(`⚠️  Tunnel closed unexpectedly (code ${code}) after successful startup. Restarting...`);
+            // Reset state for restart
+            urlVerified = false;
+            urlUpdated = false;
+            tunnelUrl = null;
+            hasError = false;
+            errorMessage = '';
+            
+            // Restart tunnel with exponential backoff (but don't count against max retries)
+            const restartDelay = 5000 + Math.random() * 2000; // 5-7 seconds
+            console.log(`🔄 Restarting tunnel in ${Math.round(restartDelay/1000)} seconds...`);
+            
+            setTimeout(async () => {
+                // Cleanup any stale processes before restart
+                await cleanupStaleProcesses(deviceId, port);
+                
+                // Check if subdomain is still active
+                console.log(`🔍 Checking if subdomain ${deviceId} is still active...`);
+                const isActive = await checkSubdomainActive(deviceId);
+                if (isActive) {
+                    console.log(`⚠️  Subdomain ${deviceId} is still active! Waiting for it to be released...`);
+                    await new Promise(resolve => setTimeout(resolve, 10000));
+                }
+                
+                // Restart tunnel (reset retry count for unexpected closes)
+                startTunnelInternal(deviceId, port, 0, maxRetries);
+            }, restartDelay);
             return;
         }
         
@@ -550,10 +717,10 @@ function startTunnelInternal(deviceId, port, retryCount, maxRetries) {
                 console.error(`   4. Check logs: journalctl -u streamzio -f`);
                 process.exit(1);
             }
-        } else if (urlVerified) {
-            console.log('✅ Tunnel started successfully with correct URL');
-            // Keep lock until shutdown
-        }
+        // Note: The else-if branch for urlVerified was removed because it's logically unreachable:
+        // - First if handles: urlVerified && code === 0 && !hasError (restarts)
+        // - Second if handles: code !== 0 || hasError || !urlVerified (errors/retries)
+        // There's no case where urlVerified is true but the first condition didn't match
     });
     
     // Handle graceful shutdown
@@ -561,6 +728,12 @@ function startTunnelInternal(deviceId, port, retryCount, maxRetries) {
         console.log(`\n🛑 Received ${signal}, shutting down tunnel...`);
         isShuttingDown = true; // Mark that we're shutting down
         clearTimeout(startupTimeout);
+        
+        // Clear health check interval
+        if (globalHealthCheckInterval) {
+            clearInterval(globalHealthCheckInterval);
+            globalHealthCheckInterval = null;
+        }
         
         // Set up close handler BEFORE killing (in case process exits quickly)
         let shutdownComplete = false;
