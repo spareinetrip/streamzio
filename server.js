@@ -1068,16 +1068,32 @@ async function extractHosterLinks(multiUpLink, postTitle = '') {
             return { links: [], metadata: { quality: null, scenegroup: null, size: null, sizeUnit: null } };
         }
         
-        // Filter to only valid links (like MultiUp-Direct)
+        // Filter to only valid links - skip invalid and unknown hosters
+        // Only hosters with validity="valid" will be processed
         const validLinks = hosterLinks.filter(link => link.validity === 'valid');
-        const linksToReturn = validLinks.length > 0 ? validLinks : hosterLinks;
+        
+        if (validLinks.length === 0) {
+            console.log(`⚠️  Found ${hosterLinks.length} hoster links, but none are valid (all marked as invalid/unknown)`);
+            console.log(`   Skipping Real-Debrid processing to avoid unnecessary API calls`);
+            // Extract metadata from post title for logging
+            const { quality, scenegroup } = extractMetadataFromPostTitle(postTitle);
+            return {
+                links: [],
+                metadata: {
+                    quality: quality || 'Unknown',
+                    scenegroup: scenegroup || 'Unknown',
+                    size: size,
+                    sizeUnit: sizeUnit
+                }
+            };
+        }
         
         // Extract metadata from post title
         const { quality, scenegroup } = extractMetadataFromPostTitle(postTitle);
         
-        console.log(`✅ Found ${linksToReturn.length} hoster links (${validLinks.length} valid)`);
+        console.log(`✅ Found ${validLinks.length} valid hoster links (skipped ${hosterLinks.length - validLinks.length} invalid/unknown)`);
         return {
-            links: linksToReturn,
+            links: validLinks,
             metadata: {
                 quality: quality || 'Unknown',
                 scenegroup: scenegroup || 'Unknown',
@@ -1125,7 +1141,35 @@ async function getRealDebridStream(link, apiKey) {
         
         return null;
     } catch (error) {
-        console.error(`❌ Real-Debrid error:`, error.response?.data || error.message);
+        // Parse Real-Debrid error response
+        const errorData = error.response?.data || {};
+        const errorCode = errorData.error_code;
+        const errorMsg = errorData.error || error.message;
+        
+        // Extract hoster name from link for better error messages
+        let hosterName = 'unknown';
+        try {
+            const urlObj = new URL(link);
+            hosterName = urlObj.hostname.replace('www.', '').split('.')[0];
+        } catch (e) {
+            // If URL parsing fails, try to extract from link string
+            const hosterMatch = link.match(/https?:\/\/(?:www\.)?([^\/]+)/);
+            if (hosterMatch) {
+                hosterName = hosterMatch[1].split('.')[0];
+            }
+        }
+        
+        // Log specific error types with clear messages
+        if (errorCode === 16 || errorMsg === 'hoster_unsupported' || errorMsg?.includes('unsupported')) {
+            console.log(`🚫 Hoster not supported by Real-Debrid: ${hosterName} (error_code: ${errorCode || 'N/A'})`);
+            console.log(`   💡 Real-Debrid does not support this hoster. Trying next hoster...`);
+        } else if (errorCode === 24 || errorMsg === 'unavailable_file' || errorMsg?.includes('unavailable')) {
+            console.log(`⚠️  File unavailable on Real-Debrid: ${hosterName} (error_code: ${errorCode || 'N/A'})`);
+            console.log(`   💡 The file may have been deleted or is no longer accessible. Trying next hoster...`);
+        } else {
+            console.log(`❌ Real-Debrid error for ${hosterName}: ${errorMsg || 'Unknown error'} (error_code: ${errorCode || 'N/A'})`);
+        }
+        
         return null;
     }
 }
@@ -1333,16 +1377,7 @@ async function handleStreamRequest(type, id, requestStartTime, config) {
                         break;
                     }
                 } catch (error) {
-                    const errorData = error.response?.data || {};
-                    const errorCode = errorData.error_code;
-                    const errorMsg = errorData.error || error.message;
-                    
-                    // Log Real-Debrid errors (including unsupported hosters)
-                    if (errorCode === 16 || errorMsg === 'hoster_unsupported') {
-                        console.log(`❌ Real-Debrid error: { error: 'hoster_unsupported', error_code: ${errorCode} }`);
-                    } else {
-                        console.log(`⚠️  Failed to get stream from ${hosterLink.host}: ${errorMsg}`);
-                    }
+                    // Error is already logged in getRealDebridStream function with detailed messages
                     // Continue to next hoster
                 }
             }
