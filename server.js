@@ -1183,7 +1183,7 @@ function createErrorStream(reason) {
     const blackScreenUrl = 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4';
     
     return {
-        name: '❌ Streamzio',
+        name: '❌  Streamzio',
         description: `No stream links were found. ${reason}`,
         url: blackScreenUrl,
         behaviorHints: {
@@ -1365,17 +1365,17 @@ async function handleStreamRequest(type, id, requestStartTime, config) {
                     const stream = await getRealDebridStream(hosterLink.url, config.realdebrid.apiKey);
                     if (stream) {
                         // Title: "📁 'Movie/series Title' SxxExx\n💾 x GB   🏷️ 'Scenegroup name'\n🔎 'hoster'"
-                        const titleLine1 = `📁 ${title} S${season.toString().padStart(2, '0')}E${episode.toString().padStart(2, '0')}`;
+                        const titleLine1 = `📁  ${title} S${season.toString().padStart(2, '0')}E${episode.toString().padStart(2, '0')}`;
                         const titleLine2Parts = [];
                         
                         if (sizeDisplay) {
-                            titleLine2Parts.push(`💾 ${sizeDisplay}`);
+                            titleLine2Parts.push(`💾  ${sizeDisplay}`);
                         }
                         
-                        titleLine2Parts.push(`🏷️ ${scenegroupDisplay}`);
+                        titleLine2Parts.push(`🏷️  ${scenegroupDisplay}`);
                         
                         const titleLine2 = titleLine2Parts.join('   '); // 3 spaces between GB and 🏷️
-                        const titleLine3 = `🔎 ${hosterLink.host}`;
+                        const titleLine3 = `🔎  ${hosterLink.host}`;
                         const streamTitle = `${titleLine1}\n${titleLine2}\n${titleLine3}`;
                         
                         // Subtitle: "Streamzio 1080p" (lowercase p)
