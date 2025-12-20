@@ -668,11 +668,22 @@ function createErrorStream(title, season, episode, errorReason, errorDescription
     // Combine "No stream links were found" with the error reason in the description
     const fullDescription = `No stream links were found. ${errorDescription}`;
     
+    // Create a proper HTTP URL for the error page with encoded parameters
+    const baseUrl = getPublicBaseUrl();
+    const errorParams = new URLSearchParams({
+        title: title,
+        season: season.toString(),
+        episode: episode.toString(),
+        reason: errorReason,
+        description: errorDescription
+    });
+    const errorUrl = `${baseUrl}/error?${errorParams.toString()}`;
+    
     return {
         title: streamTitle,
         name: streamName,
         description: fullDescription,
-        externalUrl: 'about:blank' // Placeholder URL that will show the error message in Stremio
+        externalUrl: errorUrl
     };
 }
 
@@ -1410,6 +1421,119 @@ async function startServer() {
         });
     });
     
+    // Helper function to escape HTML
+    function escapeHtml(text) {
+        if (!text) return '';
+        const map = {
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            "'": '&#039;'
+        };
+        return String(text).replace(/[&<>"']/g, m => map[m]);
+    }
+    
+    // Error page endpoint for displaying error messages in Stremio
+    app.get('/error', (req, res) => {
+        const title = req.query.title || 'Unknown';
+        const season = req.query.season || '0';
+        const episode = req.query.episode || '0';
+        const reason = req.query.reason || 'Unknown error';
+        const description = req.query.description || 'No additional details available';
+        
+        const seasonStr = String(season).padStart(2, '0');
+        const episodeStr = String(episode).padStart(2, '0');
+        
+        const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Streamzio - Error</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            margin: 0;
+            padding: 20px;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .container {
+            background: white;
+            border-radius: 12px;
+            padding: 40px;
+            max-width: 600px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        h1 {
+            color: #e74c3c;
+            margin-top: 0;
+            font-size: 28px;
+        }
+        .error-icon {
+            font-size: 64px;
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .info {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        .info-item {
+            margin: 10px 0;
+            font-size: 16px;
+        }
+        .info-label {
+            font-weight: bold;
+            color: #495057;
+        }
+        .description {
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="error-icon">❌</div>
+        <h1>No Stream Available</h1>
+        <div class="info">
+            <div class="info-item">
+                <span class="info-label">Title:</span> ${escapeHtml(title)}
+            </div>
+            <div class="info-item">
+                <span class="info-label">Episode:</span> S${seasonStr}E${episodeStr}
+            </div>
+            <div class="info-item">
+                <span class="info-label">Reason:</span> ${escapeHtml(reason)}
+            </div>
+        </div>
+        <div class="description">
+            <strong>Details:</strong><br>
+            ${escapeHtml(description)}
+        </div>
+        <p style="color: #6c757d; font-size: 14px; margin-top: 30px;">
+            This error stream was created by Streamzio to inform you that no playable streams were found for this content.
+        </p>
+    </div>
+</body>
+</html>`;
+        
+        res.setHeader('Content-Type', 'text/html');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.send(html);
+    });
+    
     app.get('/', (req, res) => {
         res.json({
             status: 'online',
@@ -1418,7 +1542,8 @@ async function startServer() {
             port: httpPort,
             endpoints: {
                 manifest: '/manifest.json',
-                health: '/health'
+                health: '/health',
+                error: '/error'
             },
             installUrl: `http://localhost:${httpPort}/manifest.json`
         });
